@@ -48,6 +48,7 @@ import {
 } from '../game/engine/phaseValidator';
 import { GoldRulesEngine, GoldRulesState, createInitialGoldRulesState } from '../game/engine/goldRulesEngine';
 import { useDeviceLayout } from '../hooks/useDeviceLayout';
+import { getHostPlayer, getOpponentPlayer, normalizeRoom, getStableUserId } from '../lib/roomAdapter';
 import { PortraitBlocker } from './layout/PortraitBlocker';
 import { GameModal } from './ui/GameModal';
 import { MobileLandscapeLayout } from './layout/MobileLandscapeLayout';
@@ -71,7 +72,7 @@ const catalogMapByName = new Map<string, any>(catalogCardsList.map((c: any) => [
 export const getMasterCardData = (card: any): any => {
   if (!card) return card;
   const normName = String(card.name || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
-  const master = catalogMapById.get(String(card.id)) || catalogMapByName.get(normName);
+  const master = catalogMapById.get(String(card.id || card.cardId)) || catalogMapByName.get(normName);
   if (master) {
     const isBlanked = card.hasNoAbility || card.losesAbilities || card.sinHabilidad || String(card.ability || '').toLowerCase().startsWith('sin habilidad') || String(card.ability || '').toLowerCase().startsWith('oro sin habilidad') || String(card.ability || '').toLowerCase().startsWith('aliado sin habilidad');
     return {
@@ -79,8 +80,10 @@ export const getMasterCardData = (card: any): any => {
       ...card,
       cost: master.cost !== undefined ? master.cost : card.cost,
       type: master.type || card.type,
+      race: master.race || card.race,
+      keywords: master.keywords || card.keywords,
       strength: master.strength !== undefined ? master.strength : card.strength,
-      ability: isBlanked ? (card.ability || 'Sin habilidad.') : (card.ability !== undefined ? card.ability : master.ability),
+      ability: isBlanked ? (card.ability || 'Sin habilidad.') : (card.ability && String(card.ability).trim() ? card.ability : master.ability),
       imageUrl: master.imageUrl || card.imageUrl,
     };
   }
@@ -246,16 +249,18 @@ export default function GameBoard({
 
   const [localIsMyTurn, setLocalIsMyTurn] = useState<boolean>(true);
 
+  const effectiveMyPlayerId = myPlayerId || getStableUserId(currentUser) || multiplayerData?.socket?.id;
+
   const isMyTurn =
     isMultiplayer
-      ? activePlayerId === myPlayerId
+      ? activePlayerId === effectiveMyPlayerId
       : (!aiBotProfile || localIsMyTurn);
 
   const canRespond =
     isMultiplayer &&
     responseWindow &&
     responsePlayerId ===
-      myPlayerId;
+      effectiveMyPlayerId;
 
   const canMakeTurnAction =
     (
@@ -264,14 +269,15 @@ export default function GameBoard({
     ) ||
     canRespond;
 
-  const isPlayer1 =
-    lobbyData?.host?.id ===
-    myPlayerId;
+  const hostPlayer = getHostPlayer(lobbyData);
+  const opponentPlayer = getOpponentPlayer(lobbyData, effectiveMyPlayerId);
+  const isPlayer1 = hostPlayer.id === effectiveMyPlayerId;
 
-  const opponentInfo =
-    isPlayer1
-      ? lobbyData?.guest
-      : lobbyData?.host;
+  // El oponente NUNCA debe ser el jugador actual
+  const rawOpponentInfo = opponentPlayer || (isPlayer1 ? lobbyData?.guest : hostPlayer);
+  const opponentInfo = (rawOpponentInfo && rawOpponentInfo.id !== effectiveMyPlayerId)
+    ? rawOpponentInfo
+    : (isPlayer1 ? (lobbyData?.guest?.id !== effectiveMyPlayerId ? lobbyData?.guest : null) : (hostPlayer.id !== effectiveMyPlayerId ? hostPlayer : null));
 
   const opponentName =
     (!isMultiplayer && aiBotProfile)
@@ -307,25 +313,28 @@ export default function GameBoard({
   // ENVIAR ACCIÓN AL SERVIDOR
   // =========================================================
 
+  const isSpectator = Boolean(multiplayerData?.isSpectator);
+
   const sendGameAction = (
     actionData: any
   ) => {
+    if (isSpectator) {
+      console.warn('[SPECTATOR] Acción bloqueada en modo espectador.');
+      return false;
+    }
 
     if (
       !isMultiplayer ||
       !lobbyCode ||
       !socket
     ) {
-
       return false;
     }
 
     console.log(
       '[GAME] PLAYER_ACTION:',
       {
-        lobbyId:
-          lobbyCode,
-
+        lobbyId: lobbyCode,
         actionData
       }
     );
@@ -333,9 +342,7 @@ export default function GameBoard({
     socket.emit(
       'player_action',
       {
-        lobbyId:
-          lobbyCode,
-
+        lobbyId: lobbyCode,
         actionData
       }
     );
@@ -369,6 +376,23 @@ export default function GameBoard({
     activatingAbilityCardId,
     setActivatingAbilityCardId
   ] = useState<string | null>(null);
+
+  // =========================================================
+  // ANIMACIÓN PÚBLICA DE REVELACIÓN PROGRESIVA DESDE CASTILLO
+  // =========================================================
+  const [castleRevealSequence, setCastleRevealSequence] = useState<{
+    sourcePlayerId: string;
+    sourcePlayerName: string;
+    cardTitle: string;
+    targetCriteriaText: string;
+    revealedCards: any[];
+    matchedCount: number;
+    totalTargetCount: number;
+    destinationZone: string;
+    completed: boolean;
+  } | null>(null);
+
+  const [revealedStepIndex, setRevealedStepIndex] = useState<number>(0);
 
   // =========================================================
   // PAGO OROS
@@ -461,6 +485,7 @@ export default function GameBoard({
   const [localSideboardMain, setLocalSideboardMain] = useState<any[]>([]);
   const [localSideboardSide, setLocalSideboardSide] = useState<any[]>([]);
   const [sideboardConfirmed, setSideboardConfirmed] = useState(false);
+  const [showSideboardModal, setShowSideboardModal] = useState(false);
   const [isPhaseStartWindow, setIsPhaseStartWindow] = useState(true);
   const [rulesState, setRulesState] = useState<GoldRulesState>(createInitialGoldRulesState);
 
@@ -509,6 +534,26 @@ export default function GameBoard({
     }, prev));
   }, [goldZone, opponentGoldZone, banished, opponentBanished, defenseZone, attackZone]);
 
+  const prevHandCountRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (prevHandCountRef.current !== null && (hand?.length || 0) > prevHandCountRef.current) {
+      const diff = (hand?.length || 0) - prevHandCountRef.current;
+      triggerVfx('DRAW', `+${diff} Carta${diff > 1 ? 's' : ''}`);
+      showNotice(`🃏 Robaste ${diff} carta${diff > 1 ? 's' : ''} de tu Castillo.`, 'info');
+    }
+    prevHandCountRef.current = hand?.length || 0;
+  }, [hand?.length]);
+
+  const prevOppHandCountRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (prevOppHandCountRef.current !== null && (opponentHandCount || 0) > prevOppHandCountRef.current) {
+      const diff = (opponentHandCount || 0) - prevOppHandCountRef.current;
+      triggerVfx('DRAW', `+${diff} Rival`);
+      showNotice(`🃏 ${opponentName || 'El rival'} robó ${diff} carta${diff > 1 ? 's' : ''}.`, 'info');
+    }
+    prevOppHandCountRef.current = opponentHandCount || 0;
+  }, [opponentHandCount, opponentName]);
+
   // Inicializar estado local de sideboard cuando entramos a la fase
   useEffect(() => {
     if (matchState?.phase === 'SIDEBOARDING') {
@@ -539,8 +584,10 @@ export default function GameBoard({
   }, [currentPhaseIndex, isMultiplayer, advancePhase]);
 
   // Disparo automático de habilidades al inicio de Vigilia (DAR 5.B)
+  const lastVigiliaTurnRef = useRef<number | null>(null);
   useEffect(() => {
-    if (currentPhaseIndex === DAR_PHASE_INDEX.VIGILIA) {
+    if (currentPhaseIndex === DAR_PHASE_INDEX.VIGILIA && lastVigiliaTurnRef.current !== turn) {
+      lastVigiliaTurnRef.current = turn;
       const allMyCards = [...defenseZone, ...attackZone, ...totemZone, ...goldZone];
       allMyCards.forEach((c: any) => {
         const abNorm = String(c.ability || '').toLowerCase();
@@ -549,7 +596,28 @@ export default function GameBoard({
         }
       });
     }
-  }, [currentPhaseIndex, turn]);
+  }, [currentPhaseIndex, turn, defenseZone, attackZone, totemZone, goldZone]);
+
+  // Disparo automático de habilidades al inicio del Turno Oponente (ej. Armería del Guerrero)
+  const lastOpponentTurnTriggerRef = useRef<number | null>(null);
+  useEffect(() => {
+    const isOppTurn = isMultiplayer ? !isMyTurn : !localIsMyTurn;
+    if (isOppTurn && lastOpponentTurnTriggerRef.current !== turn) {
+      lastOpponentTurnTriggerRef.current = turn;
+      const allMyCards = [...defenseZone, ...attackZone, ...totemZone, ...goldZone];
+      allMyCards.forEach((c: any) => {
+        const abNorm = String(c.ability || '').toLowerCase();
+        if (
+          abNorm.includes('comienzo del turno oponente') ||
+          abNorm.includes('inicio del turno oponente') ||
+          abNorm.includes('comienzo del turno de tu oponente') ||
+          abNorm.includes('inicio del turno de tu oponente')
+        ) {
+          executeCardAbility(c, false, 'OPPONENT_TURN_START');
+        }
+      });
+    }
+  }, [isMultiplayer, isMyTurn, localIsMyTurn, turn, defenseZone, attackZone, totemZone, goldZone]);
 
   // Registro automático de resultados de partida en estadísticas del perfil
   const recordedMatchRef = useRef(false);
@@ -557,11 +625,13 @@ export default function GameBoard({
     if (matchState?.phase === 'MATCH_OVER' && !recordedMatchRef.current) {
       recordedMatchRef.current = true;
       const isWinner = matchState.winnerId === myPlayerId;
+      const isRanked = Boolean(multiplayerData?.lobbyData?.isRanked);
       recordMatchResult(
         currentUser?.username,
         currentDeckName || 'Mazo Principal',
         isWinner,
-        opponentName || 'Oponente'
+        opponentName || 'Oponente',
+        isRanked
       );
     }
   }, [matchState?.phase, matchState?.winnerId, myPlayerId, currentUser?.username, currentDeckName, opponentName]);
@@ -581,18 +651,15 @@ export default function GameBoard({
     }
   }, [isMultiplayer, castleCards?.length, opponentCastleCount, localGameResult]);
 
-  // Temporizador de Ronda 40 min + 5 min tiempo extra
+  // Temporizador de Ronda 40 min + 5 min tiempo extra (en tiempo real para todos los modos)
+  const localMatchStartRef = useRef<number>(Date.now());
   useEffect(() => {
-    if (!matchState?.roundStartTime) {
-      setTimeLeftSeconds(40 * 60);
-      setIsExtraTime(false);
-      return;
-    }
+    const startTime = matchState?.roundStartTime || localMatchStartRef.current;
+    const normalDurationMs = matchState?.roundDurationMs || 40 * 60 * 1000;
+    const extraDurationMs = matchState?.extraTimeDurationMs || 5 * 60 * 1000;
 
-    const interval = setInterval(() => {
-      const elapsedMs = Date.now() - matchState.roundStartTime;
-      const normalDurationMs = matchState.roundDurationMs || 40 * 60 * 1000;
-      const extraDurationMs = matchState.extraTimeDurationMs || 5 * 60 * 1000;
+    const updateTimer = () => {
+      const elapsedMs = Date.now() - startTime;
       const remainingNormalMs = normalDurationMs - elapsedMs;
 
       if (remainingNormalMs > 0) {
@@ -604,8 +671,10 @@ export default function GameBoard({
         setTimeLeftSeconds(Math.max(0, Math.ceil(remainingExtraMs / 1000)));
         setIsExtraTime(true);
       }
-    }, 1000);
+    };
 
+    updateTimer();
+    const interval = setInterval(updateTimer, 1000);
     return () => clearInterval(interval);
   }, [matchState?.roundStartTime, matchState?.roundDurationMs, matchState?.extraTimeDurationMs]);
 
@@ -660,25 +729,57 @@ export default function GameBoard({
   };
 
   const handleSurrender = () => {
-    sendGameAction({ type: 'SURRENDER' });
+    if (isSpectator) {
+      if (typeof setView === 'function') setView('lobby');
+      setShowSurrenderModal(false);
+      return;
+    }
+
+    if (isMultiplayer) {
+      sendGameAction({ action: 'SURRENDER', type: 'SURRENDER' });
+      socket?.emit?.('player_action', {
+        lobbyId: multiplayerData?.lobbyData?.id || multiplayerData?.lobbyData?.lobbyId,
+        actionData: { action: 'SURRENDER', type: 'SURRENDER' },
+      });
+      setLocalGameResult('DEFEAT');
+      const isRanked = Boolean(multiplayerData?.lobbyData?.isRanked);
+      recordMatchResult(
+        currentUser?.username,
+        currentDeckName || 'Mazo Principal',
+        false,
+        opponentName || 'Oponente',
+        isRanked
+      );
+      showNotice('🏳️ Te has rendido. La partida ha finalizado.', 'warning');
+    } else {
+      setLocalGameResult('DEFEAT');
+      recordMatchResult(
+        currentUser?.username,
+        currentDeckName || 'Mazo Principal',
+        false,
+        opponentName || 'Bot Oponente',
+        false
+      );
+      showNotice('🏳️ Te has rendido. La partida ha finalizado.', 'warning');
+    }
     setShowSurrenderModal(false);
   };
 
   const handleGoldMulligan = () => {
-    if (isMultiplayer) {
-      sendGameAction({ type: 'REVEAL_MULLIGAN_HAND' });
+    if (executeMulligan) {
+      executeMulligan(true);
     } else {
       const newCastle = [...castleCards, ...hand];
       const shuffled = [...newCastle].sort(() => Math.random() - 0.5);
       setHand(shuffled.slice(0, 8));
       setCastleCards(shuffled.slice(8));
     }
-    setShowMulliganModal(false);
+    // El modal permanece abierto para ver la nueva mano
   };
 
   const handleNormalMulligan = () => {
-    if (isMultiplayer) {
-      sendGameAction({ type: 'EXECUTE_NORMAL_MULLIGAN' });
+    if (executeMulligan) {
+      executeMulligan(false);
     } else {
       const nextCount = Math.max(1, 8 - (mulliganCount || 0) - 1);
       const newCastle = [...castleCards, ...hand];
@@ -686,7 +787,7 @@ export default function GameBoard({
       setHand(shuffled.slice(0, nextCount));
       setCastleCards(shuffled.slice(nextCount));
     }
-    setShowMulliganModal(false);
+    // El modal permanece abierto para ver la nueva mano
   };
 
   const myScore = matchState?.scores?.[myPlayerId] ?? 0;
@@ -844,9 +945,17 @@ export default function GameBoard({
     resolver: (val: any) => void;
   } | null>(null);
 
-  const showNotice = (message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info', icon?: string) => {
+  const showNotice = (message: any, type: 'info' | 'success' | 'warning' | 'error' = 'info', icon?: string) => {
     const id = String(Date.now() + Math.random());
-    setGameNotice({ id, message, type, icon });
+    let cleanMessage = '';
+    if (typeof message === 'string') {
+      cleanMessage = message;
+    } else if (message && typeof message === 'object') {
+      cleanMessage = message.error || message.message || message.description || message.reason || message.text || JSON.stringify(message);
+    } else {
+      cleanMessage = String(message ?? '');
+    }
+    setGameNotice({ id, message: cleanMessage, type, icon });
     setTimeout(() => {
       setGameNotice((prev) => (prev?.id === id ? null : prev));
     }, 4500);
@@ -927,6 +1036,51 @@ export default function GameBoard({
     showNotice(`🪙 ¡Se generó ${count} Oro(s) en tu Reserva! (${reason})`, 'success');
     return newGolds;
   };
+
+  // =========================================================
+  // DISPARADOR DE DON DE AMMA (2DO ORO DEL OPONENTE)
+  // "Cuando tu oponente pone su segundo oro en juego puedes poner don de amma desde tu mano o cementerio en tu oro pagado"
+  // =========================================================
+  const donDeAmmaTriggeredRef = useRef(false);
+  useEffect(() => {
+    const oppGoldCount = opponentGoldZone?.length ?? 0;
+    if (oppGoldCount >= 2 && !donDeAmmaTriggeredRef.current) {
+      const ammaInHand = (hand || []).find((c: any) => (c.name || '').toLowerCase().includes('don de amma'));
+      const ammaInGrave = (graveyard || []).find((c: any) => (c.name || '').toLowerCase().includes('don de amma'));
+      const ammaCard = ammaInHand || ammaInGrave;
+      const zoneSource = ammaInHand ? 'Mano' : 'Cementerio';
+
+      if (ammaCard) {
+        donDeAmmaTriggeredRef.current = true;
+        void (async () => {
+          const activateAmma = await showConfirm(
+            '🌟 Don de Amma - Disparador',
+            `Tu oponente tiene ${oppGoldCount} Oros en juego.\n\n¿Deseas activar la habilidad de Don de Amma para ponerlo desde tu ${zoneSource} en tu Oro Pagado?`,
+            '✨ Disparador de Oro'
+          );
+
+          if (activateAmma) {
+            if (ammaInHand) {
+              setHand((prev: any[]) => prev.filter((c: any) => c.instanceId !== ammaCard.instanceId));
+            } else {
+              setGraveyard((prev: any[]) => prev.filter((c: any) => c.instanceId !== ammaCard.instanceId));
+            }
+
+            const newPaidGold = {
+              ...ammaCard,
+              zone: 'GOLD',
+              isRested: true,
+              isPaid: true,
+              exhausted: true
+            };
+
+            setGoldZone((prev: any[]) => [...(prev || []), newPaidGold]);
+            showNotice(`🌟 ¡Don de Amma activado! Puesto en tu Oro Pagado desde tu ${zoneSource}.`, 'success');
+          }
+        })();
+      }
+    }
+  }, [opponentGoldZone?.length, hand, graveyard]);
 
   // MODAL GENÉRICO DE SELECCIÓN DE CARTAS EN MANO (Kaitai, Trono del Dragón, etc.)
   const [handSelectionModal, setHandSelectionModal] = useState<{
@@ -1142,35 +1296,33 @@ export default function GameBoard({
     card: any,
     keyword: string
   ): boolean => {
+    if (!card) return false;
+    const normalized = keyword.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
-    if (!card) {
-      return false;
-    }
+    if (normalized === 'furia' && (card.hasFury || card.furia)) return true;
+    if (normalized === 'indestructible' && card.isIndestructible) return true;
+    if (normalized === 'indesterrable' && card.isIndesterrable) return true;
+    if ((normalized === 'imbloqueable' || normalized === 'inbloqueable') && card.isUnblockable) return true;
 
-    const normalized =
-      keyword
-        .trim()
-        .toLowerCase();
-
-    if (
-      getCardKeywords(
-        card
-      ).includes(
-        normalized
-      )
-    ) {
-
+    if (getCardKeywords(card).map((k: string) => String(k).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')).includes(normalized)) {
       return true;
     }
 
-    const abilityText =
-      String(
-        card.ability || ''
-      ).toLowerCase();
+    const abilityText = String(card.ability || card.text || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    if (normalized === 'furia') {
+      return /\bfuria\b/.test(abilityText);
+    }
+    if (normalized === 'indestructible') {
+      return /\bindestructible\b/.test(abilityText) || abilityText.includes('no puede ser destruid') || abilityText.includes('no pueden ser destruid');
+    }
+    if (normalized === 'indesterrable') {
+      return /\bindesterrable\b/.test(abilityText) || abilityText.includes('no puede ser desterrad') || abilityText.includes('no pueden ser desterrad');
+    }
+    if (normalized === 'imbloqueable' || normalized === 'inbloqueable') {
+      return /\bimbloqueable\b/.test(abilityText) || /\binbloqueable\b/.test(abilityText) || abilityText.includes('no puede ser bloquead') || abilityText.includes('no pueden ser bloquead');
+    }
 
-    return abilityText.includes(
-      normalized
-    );
+    return abilityText.includes(normalized);
   };
 
   const hasFury = (
@@ -1725,7 +1877,62 @@ export default function GameBoard({
       });
     };
 
-    const onAbilityResolved = () => setAbilityPrompt(null);
+    const onNotice = (data: any) => {
+      if (!data) return;
+      const msg = typeof data === 'string' ? data : (data.message || data.text || '');
+      if (!msg) return;
+      const level = data.level || data.type || 'info';
+      showNotice(msg, level === 'error' ? 'error' : level === 'warning' ? 'warning' : level === 'success' ? 'success' : 'info');
+    };
+
+    const onAbilityDraw = (data: any) => {
+      if (!data) return;
+      const amount = Number(data.amount || data.effect?.amount || 1);
+      const targetPlayerId = data.playerId || data.effect?.playerId;
+      const isMe = !targetPlayerId || targetPlayerId === effectiveMyPlayerId || targetPlayerId === myPlayerId;
+      if (isMe) {
+        triggerVfx('DRAW', `+${amount} Carta${amount > 1 ? 's' : ''}`);
+        const currentCastle = castleCardsRef.current || castleCards || [];
+        const drawnSlice = currentCastle.slice(0, amount);
+        if (drawnSlice.length > 0) {
+          setDrawnCardAnim({
+            cards: drawnSlice,
+            count: amount
+          });
+          setTimeout(() => setDrawnCardAnim(null), Math.min(3000, 1600 + amount * 400));
+        }
+      } else {
+        triggerVfx('DRAW', `+${amount} Rival`);
+        showNotice(`🃏 ${opponentName || 'El rival'} robó ${amount} carta${amount > 1 ? 's' : ''} por habilidad.`, 'info');
+      }
+    };
+
+    const onAbilityResolved = (data: any) => {
+      setAbilityPrompt(null);
+      if (data?.effect) {
+        const eff = data.effect;
+        if (eff.type === 'ability_draw' || eff.type === 'draw') {
+          onAbilityDraw({ ...data, ...eff });
+        } else if (eff.type === 'notice' || eff.message) {
+          onNotice(eff);
+        } else if (eff.type === 'ability_mill' || eff.type === 'mill') {
+          showNotice(`🏰 Botó ${eff.amount || 1} carta(s) del Castillo.`, 'info');
+        } else if (eff.type === 'ability_destroy' || eff.type === 'card_destroyed') {
+          triggerVfx('DESTROY', '💥 Destruida');
+        } else if (eff.type === 'ability_banish' || eff.type === 'card_banished') {
+          triggerVfx('BANISH', '🔥 Desterrada');
+        }
+      }
+    };
+
+    const onCardPlayAnnounced = (data: any) => {
+      if (!data || !data.cardName) return;
+      const targetPlayerId = data.playerId;
+      const isMe = Boolean(targetPlayerId && (targetPlayerId === effectiveMyPlayerId || targetPlayerId === myPlayerId));
+      if (!isMe) {
+        showNotice(`⚡ ${data.playerName || opponentName || 'El rival'} jugó "${data.cardName}" (${data.cardType || 'Carta'}).`, 'info', '⚡');
+      }
+    };
 
     const onRevealOpponentHand = (data: any) => {
       if (!data || !Array.isArray(data.hand)) return;
@@ -1739,43 +1946,72 @@ export default function GameBoard({
       });
     };
 
+    const onCastleRevealSequence = (data: any) => {
+      if (!data || !Array.isArray(data.revealedCards)) return;
+      setCastleRevealSequence(data);
+      setRevealedStepIndex(1);
+    };
+
+    const onPublicActionFeed = (data: any) => {
+      if (!data) return;
+      showNotice(
+        `${data.playerName || 'Jugador'}: ${data.description || `${data.cardName} (${data.cardType || 'Carta'})`}`,
+        data.type === 'ABILITY_CANCELLED' ? 'error' : data.type === 'ABILITY_RESOLVED' ? 'success' : 'info',
+        data.type === 'ABILITY_CANCELLED' ? '❌' : data.type === 'ABILITY_RESOLVED' ? '✓' : '⚡'
+      );
+    };
+
     socket.on('castle_search_options', onSearchOptions);
     socket.on('castle_search_cancelled', onSearchCancelled);
     socket.on('ability_prompt', onAbilityPrompt);
     socket.on('ability_resolved', onAbilityResolved);
+    socket.on('ability_draw', onAbilityDraw);
+    socket.on('notice', onNotice);
+    socket.on('card_play_announced', onCardPlayAnnounced);
     socket.on('REVEAL_OPPONENT_HAND_FOR_BANISH', onRevealOpponentHand);
+    socket.on('CASTLE_REVEAL_SEQUENCE', onCastleRevealSequence);
+    socket.on('castle_reveal_sequence', onCastleRevealSequence);
+    socket.on('PUBLIC_ACTION_FEED', onPublicActionFeed);
+    socket.on('public_action_feed', onPublicActionFeed);
 
     return () => {
       socket.off('castle_search_options', onSearchOptions);
       socket.off('castle_search_cancelled', onSearchCancelled);
       socket.off('ability_prompt', onAbilityPrompt);
       socket.off('ability_resolved', onAbilityResolved);
+      socket.off('ability_draw', onAbilityDraw);
+      socket.off('notice', onNotice);
+      socket.off('card_play_announced', onCardPlayAnnounced);
       socket.off('REVEAL_OPPONENT_HAND_FOR_BANISH', onRevealOpponentHand);
+      socket.off('CASTLE_REVEAL_SEQUENCE', onCastleRevealSequence);
+      socket.off('castle_reveal_sequence', onCastleRevealSequence);
+      socket.off('PUBLIC_ACTION_FEED', onPublicActionFeed);
+      socket.off('public_action_feed', onPublicActionFeed);
     };
-  }, [socket]);
+  }, [socket, effectiveMyPlayerId, myPlayerId, opponentName, castleCards]);
+
+  // Avance secuencial animado paso a paso para la revelación de cartas desde el Castillo
+  useEffect(() => {
+    if (!castleRevealSequence) return;
+    if (revealedStepIndex < castleRevealSequence.revealedCards.length) {
+      const timer = setTimeout(() => {
+        setRevealedStepIndex((prev) => prev + 1);
+      }, 550);
+      return () => clearTimeout(timer);
+    }
+  }, [castleRevealSequence, revealedStepIndex]);
 
   // =========================================================
   // ROBO POR TURNO
   // =========================================================
 
   useEffect(() => {
-
-    if (
-      lastProcessedTurn.current !==
-      turn
-    ) {
-
-      setHasDrawnThisFinal(
-        false
-      );
-
-      lastProcessedTurn.current =
-        turn;
+    if (lastProcessedTurn.current !== turn) {
+      setHasDrawnThisFinal(false);
+      setGoldPlayedFromHandThisTurn(false);
+      lastProcessedTurn.current = turn;
     }
-
-  }, [
-    turn
-  ]);
+  }, [turn]);
 
   // Ref sincronizada del Castillo para evitar clonación/duplicación en robos consecutivos inmediatos
   const castleCardsRef = useRef(castleCards);
@@ -3466,9 +3702,232 @@ export default function GameBoard({
               }
               return [...prev, ...newGolds];
             });
+          },
+
+          playCardDirectly: (c: any) => {
+            playCardFromHand(c);
+          },
+
+          shuffleCastle: () => {
+            shuffleCastleWithAnim();
           }
         };
 
+
+        // Búsqueda Progresiva Carta por Carta desde el Castillo (ej. Acabar la Esperanza)
+        if (
+          normAb.includes('muestra cartas del tope de tu castillo hasta') ||
+          normAb.includes('revela cartas del tope de tu castillo hasta') ||
+          normName.includes('acabar')
+        ) {
+          let targetType = 'Oro';
+          if (normAb.includes('aliado')) targetType = 'Aliado';
+          if (normAb.includes('talisman')) targetType = 'Talismán';
+          if (normAb.includes('totem')) targetType = 'Tótem';
+          if (normAb.includes('oro')) targetType = 'Oro';
+
+          let targetCount = 2;
+          if (normAb.includes('hasta tres cartas') || normAb.includes('hasta 3 cartas')) targetCount = 3;
+          if (normAb.includes('hasta una carta') || normAb.includes('hasta 1 carta')) targetCount = 1;
+          if (normAb.includes('hasta dos cartas') || normAb.includes('hasta 2 cartas')) targetCount = 2;
+
+          executeCastleRevealSearch({
+            cardTitle: card.name || 'Acabar la Esperanza',
+            targetCriteriaText: `${targetCount} ${targetType}s`,
+            targetType,
+            targetCount,
+            destinationZone: 'hand'
+          });
+          return true;
+        }
+
+        // Nyssara Cautiva:
+        // "Cuando entra o sale del juego puedes buscar un Talismán en un Castillo, juégalo pagando su coste y Roba una carta."
+        if (
+          normName.includes('nyssara cautiva') &&
+          (activeTrigger === 'CARD_ENTERS_PLAY' || activeTrigger === 'ON_LEAVE_PLAY' || activeTrigger === 'CARD_LEAVES_PLAY' || activeTrigger === 'ON_PLAY')
+        ) {
+          const talismans = castleCards.filter((c: any) => c.type === 'Talismán' || c.type === 'Talisman');
+          let selectedTalisman: any = null;
+
+          if (talismans.length > 0) {
+            const promptOptions = [
+              ...talismans.map((t: any) => ({
+                id: t.instanceId || t.id,
+                label: `${t.name} (Coste: ${t.cost ?? 1})`,
+                imageUrl: t.imageUrl
+              })),
+              {
+                id: 'FAIL_SEARCH',
+                label: '✕ Fallar búsqueda voluntariamente (No jugar Talismán)',
+                imageUrl: undefined
+              }
+            ];
+
+            const chosenId = await requestAbilityPrompt({
+              title: 'Nyssara Cautiva — Buscar Talismán en Castillo',
+              message: 'Selecciona un Talismán para jugarlo pagando su coste, o falla la búsqueda voluntariamente:',
+              options: promptOptions,
+              sourceCard: card
+            });
+
+            if (chosenId && chosenId !== 'FAIL_SEARCH') {
+              selectedTalisman = talismans.find((t: any) => (t.instanceId || t.id) === chosenId) || null;
+            }
+          }
+
+          // Si se seleccionó Talismán, se extrae del Castillo y se juega directamente (no a la mano)
+          if (selectedTalisman) {
+            setCastleCards((prev: any[]) => prev.filter((c: any) => (c.instanceId || c.id) !== (selectedTalisman.instanceId || selectedTalisman.id)));
+            showNotice(`✨ Nyssara Cautiva jugó "${selectedTalisman.name}" desde el Castillo.`, 'success');
+            playCardFromHand(selectedTalisman);
+          } else {
+            showNotice('🔍 Búsqueda de Talismán de Nyssara Cautiva finalizada sin seleccionar carta.', 'info');
+          }
+
+          // Barajar el Castillo (DAR p. 17)
+          shuffleCastleWithAnim();
+
+          // Robar 1 carta incondicionalmente (DAR p. 12 & p. 17)
+          drawCardByEffect();
+          showNotice('🃏 Robaste 1 carta por la habilidad de Nyssara Cautiva.', 'info');
+          return true;
+        }
+
+        // Nyssara Cautiva en Vigilia:
+        // "En tu Vigilia, Una vez por turno, tu oponente Bota una carta por cada Aliado que controles."
+        if (
+          normName.includes('nyssara cautiva') &&
+          (activeTrigger === 'ACTIVATED_ONCE_PER_TURN' || activeTrigger === 'VIGILIA')
+        ) {
+          const allyCount = [...defenseZone, ...attackZone].filter((c: any) => c.type === 'Aliado').length;
+          if (allyCount > 0) {
+            if (typeof setOpponentCastleCards === 'function') {
+              setOpponentCastleCards((prev: any[]) => {
+                const milled = (prev || []).slice(0, allyCount);
+                setRecentOpponentGraveyardCards(milled);
+                if (typeof setOpponentGraveyard === 'function') {
+                  setOpponentGraveyard((g: any[]) => [...(g || []), ...milled]);
+                }
+                return (prev || []).slice(allyCount);
+              });
+            }
+            if (typeof setOpponentCastleCount === 'function') {
+              setOpponentCastleCount((c: number) => Math.max(0, (c ?? 0) - allyCount));
+            }
+            showNotice(`⚔️ Nyssara Cautiva hizo Botar ${allyCount} carta${allyCount > 1 ? 's' : ''} al oponente.`, 'success');
+          } else {
+            showNotice('Nyssara Cautiva: No controlas Aliados para hacer botar cartas.', 'info');
+          }
+          return true;
+        }
+
+        // Arpa de David:
+        // "Cuando entra en juego, Roba una carta. En tu Vigilia, una vez por turno, puedes Barajar una carta que controles para Barajar una carta oponente de coste 1 o menos."
+        if (normName.includes('arpa de david')) {
+          if (activeTrigger === 'CARD_ENTERS_PLAY' || activeTrigger === 'ON_PLAY') {
+            drawCardByEffect();
+            showNotice('🃏 Arpa de David: Robaste 1 carta al entrar en juego.', 'success');
+            return true;
+          }
+          if (activeTrigger === 'ACTIVATED_ONCE_PER_TURN' || activeTrigger === 'VIGILIA') {
+            const myCards = [...defenseZone, ...attackZone, ...totemZone, ...goldZone].filter((c: any) => (c.instanceId || c.id) !== (card.instanceId || card.id));
+            const oppCards = [...(opponentDefenseZone || []), ...(opponentAttackZone || []), ...(opponentTotemZone || []), ...(opponentGoldZone || [])].filter((c: any) => (c.cost ?? 0) <= 1);
+            
+            if (myCards.length > 0 && oppCards.length > 0) {
+              const myPickId = await requestAbilityPrompt({
+                title: 'Arpa de David — Selecciona carta a Barajar',
+                message: 'Selecciona una carta que controles para barajarla en tu Castillo:',
+                options: myCards.map((c: any) => ({ id: c.instanceId || c.id, label: `${c.name} (${c.type})`, imageUrl: c.imageUrl })),
+                sourceCard: card
+              });
+              if (myPickId) {
+                const oppPickId = await requestAbilityPrompt({
+                  title: 'Arpa de David — Selecciona carta oponente',
+                  message: 'Selecciona una carta oponente de coste 1 o menos para barajar en su Castillo:',
+                  options: oppCards.map((c: any) => ({ id: c.instanceId || c.id, label: `${c.name} (${c.type}) - Coste: ${c.cost ?? 0}`, imageUrl: c.imageUrl })),
+                  sourceCard: card
+                });
+                if (oppPickId) {
+                  // Barajar mi carta
+                  setDefenseZone((prev: any[]) => prev.filter((c: any) => (c.instanceId || c.id) !== myPickId));
+                  setAttackZone((prev: any[]) => prev.filter((c: any) => (c.instanceId || c.id) !== myPickId));
+                  setTotemZone((prev: any[]) => prev.filter((c: any) => (c.instanceId || c.id) !== myPickId));
+                  setGoldZone((prev: any[]) => prev.filter((c: any) => (c.instanceId || c.id) !== myPickId));
+                  shuffleCastleWithAnim();
+
+                  if (typeof setOpponentDefenseZone === 'function') {
+                    setOpponentDefenseZone((prev: any[]) => prev.filter((c: any) => (c.instanceId || c.id) !== oppPickId));
+                  }
+                  if (typeof setOpponentGoldZone === 'function') {
+                    setOpponentGoldZone((prev: any[]) => prev.filter((c: any) => (c.instanceId || c.id) !== oppPickId));
+                  }
+                  showNotice('✨ Arpa de David barajó las cartas seleccionadas.', 'success');
+                }
+              }
+            } else {
+              showNotice('Arpa de David: No hay objetivos válidos de coste 1 o menos en campo rival.', 'info');
+            }
+            return true;
+          }
+        }
+
+        // Escamas de Dragón ("Escama"):
+        // "Cuando entra en juego, cada jugador Bota tres cartas y tú Robas una carta. En tu Vigilia, una vez por turno, puedes Descartar una carta para buscar una carta en tu Castillo y ponerla en tu Cementerio."
+        if (normName.includes('escamas de dragon') || normName.includes('escamas de azi')) {
+          if (activeTrigger === 'CARD_ENTERS_PLAY' || activeTrigger === 'ON_PLAY') {
+            if (typeof setOpponentCastleCards === 'function') {
+              setOpponentCastleCards((prev: any[]) => {
+                const milled = (prev || []).slice(0, 3);
+                setRecentOpponentGraveyardCards(milled);
+                if (typeof setOpponentGraveyard === 'function') setOpponentGraveyard((g: any[]) => [...(g || []), ...milled]);
+                return (prev || []).slice(3);
+              });
+            }
+            setCastleCards((prev: any[]) => {
+              const milled = prev.slice(0, 3);
+              setGraveyard((g: any[]) => [...g, ...milled]);
+              return prev.slice(3);
+            });
+            drawCardByEffect();
+            showNotice('🐉 Escamas de Dragón: Ambos botaron 3 cartas y robaste 1 carta.', 'success');
+            return true;
+          }
+          if (activeTrigger === 'ACTIVATED_ONCE_PER_TURN' || activeTrigger === 'VIGILIA') {
+            if (hand.length > 0 && castleCards.length > 0) {
+              const discardId = await requestAbilityPrompt({
+                title: 'Escamas de Dragón — Descartar carta',
+                message: 'Selecciona una carta de tu mano para descartar:',
+                options: hand.map((c: any) => ({ id: c.instanceId || c.id, label: `${c.name} (${c.type})`, imageUrl: c.imageUrl })),
+                sourceCard: card
+              });
+              if (discardId) {
+                const discarded = hand.find((c: any) => (c.instanceId || c.id) === discardId);
+                setHand((prev: any[]) => prev.filter((c: any) => (c.instanceId || c.id) !== discardId));
+                if (discarded) setGraveyard((prev: any[]) => [...prev, { ...discarded, zone: 'GRAVEYARD' }]);
+
+                const castlePickId = await requestAbilityPrompt({
+                  title: 'Escamas de Dragón — Buscar en Castillo',
+                  message: 'Selecciona una carta de tu Castillo para enviarla directamente al Cementerio:',
+                  options: castleCards.map((c: any) => ({ id: c.instanceId || c.id, label: `${c.name} (${c.type})`, imageUrl: c.imageUrl })),
+                  sourceCard: card
+                });
+                if (castlePickId) {
+                  const targetCard = castleCards.find((c: any) => (c.instanceId || c.id) === castlePickId);
+                  if (targetCard) {
+                    setCastleCards((prev: any[]) => prev.filter((c: any) => (c.instanceId || c.id) !== castlePickId));
+                    setGraveyard((prev: any[]) => [...prev, { ...targetCard, zone: 'GRAVEYARD' }]);
+                    shuffleCastleWithAnim();
+                    showNotice(`✨ "${targetCard.name}" fue enviada directamente al Cementerio.`, 'success');
+                  }
+                }
+              }
+            } else {
+              showNotice('Escamas de Dragón: No tienes cartas en mano o en Castillo.', 'info');
+            }
+            return true;
+          }
+        }
 
         const handledByEngine = await AbilityInterpreter.executeAbility(executionContext);
         if (!handledByEngine) {
@@ -3966,7 +4425,7 @@ export default function GameBoard({
                   abilityPromptResolverRef.current(true);
                   setAbilityPrompt(null);
                 }}
-                className="flex-1 py-2.5 bg-gradient-to-r from-amber-500 via-amber-400 to-amber-500 hover:from-amber-400 text-zinc-950 rounded-xl font-black text-xs uppercase tracking-wider transition shadow active:scale-95 cursor-pointer"
+                className="flex-1 py-2.5 bg-gradient-to-r from-amber-500 via-amber-400 to-amber-500 hover:from-amber-400 text-zinc-950 rounded-xl font-black text-xs uppercase tracking-wider transition shadow shadow-amber-500/20 active:scale-95 cursor-pointer"
               >
                 ✨ Activar ({abilityPrompt.cardName || 'Efecto'})
               </button>
@@ -3976,7 +4435,7 @@ export default function GameBoard({
                   abilityPromptResolverRef.current(false);
                   setAbilityPrompt(null);
                 }}
-                className="flex-1 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-xl font-bold text-xs uppercase tracking-wider transition active:scale-95 cursor-pointer"
+                className="flex-1 py-2.5 bg-white/[0.05] hover:bg-white/[0.1] text-zinc-300 rounded-xl font-bold text-xs uppercase tracking-wider transition active:scale-95 cursor-pointer"
               >
                 ❌ Pasar
               </button>
@@ -3987,14 +4446,14 @@ export default function GameBoard({
                 abilityPromptResolverRef.current(true);
                 setAbilityPrompt(null);
               }}
-              className="w-full py-2.5 bg-amber-500 text-zinc-950 rounded-xl font-black text-xs hover:bg-amber-400 active:scale-95 cursor-pointer"
+              className="w-full py-2.5 bg-amber-500 text-zinc-950 rounded-xl font-black text-xs hover:bg-amber-400 active:scale-95 cursor-pointer shadow-lg shadow-amber-500/20"
             >
               Confirmar Pago
             </button>
           ) : (
             <button
               onClick={handleClose}
-              className="w-full py-2 bg-zinc-900 hover:bg-zinc-800 text-zinc-400 font-bold text-xs rounded-xl border border-zinc-700"
+              className="w-full py-2 bg-white/[0.04] hover:bg-white/[0.08] text-zinc-400 font-bold text-xs rounded-xl border border-white/[0.06]"
             >
               Cancelar
             </button>
@@ -4003,7 +4462,7 @@ export default function GameBoard({
       >
         {/* Ability Card Text */}
         {abilityPrompt.cardAbility && (
-          <div className="mb-2 p-2 bg-zinc-950/80 border border-amber-500/30 rounded-xl">
+          <div className="mb-2 p-2 bg-white/[0.03] border border-white/[0.06] rounded-xl">
             <span className="text-[9px] font-bold text-amber-400 uppercase tracking-wider block mb-0.5">
               📜 Texto de la Carta:
             </span>
@@ -4021,7 +4480,7 @@ export default function GameBoard({
 
         {/* Mode: CONFIRM */}
         {abilityPrompt.mode === 'CONFIRM' && (
-          <div className="p-2.5 bg-zinc-950/90 border border-amber-500/40 rounded-xl shadow-inner my-1">
+          <div className="p-2.5 bg-white/[0.03] border border-white/[0.06] rounded-xl shadow-inner my-1">
             <span className="text-[9px] text-amber-400 font-bold uppercase tracking-wider block mb-0.5">
               ⚡ Efecto a Resolver:
             </span>
@@ -4093,7 +4552,7 @@ export default function GameBoard({
                       abilityPromptResolverRef.current(card);
                       setAbilityPrompt(null);
                     }}
-                    className="relative aspect-[2.5/3.5] rounded-xl overflow-hidden border border-zinc-700 hover:border-amber-400 hover:scale-105 active:scale-95 transition shadow"
+                    className="relative aspect-[2.5/3.5] rounded-xl overflow-hidden border border-white/[0.08] hover:border-amber-500/50 hover:scale-105 active:scale-95 transition shadow"
                   >
                     <img src={card.imageUrl} alt={card.name || 'Carta'} className="w-full h-full object-cover" />
                   </button>
@@ -4118,7 +4577,7 @@ export default function GameBoard({
                     if (abilityPromptResolverRef.current) abilityPromptResolverRef.current(opt.id);
                     setAbilityPrompt(null);
                   }}
-                  className="w-full p-2.5 bg-gradient-to-r from-[#24170e] to-[#140e08] hover:from-amber-600 hover:to-amber-700 border border-amber-500/60 text-amber-100 hover:text-zinc-950 rounded-xl font-bold text-xs flex items-center justify-between transition active:scale-95 shadow cursor-pointer text-left"
+                  className="w-full p-2.5 bg-gradient-to-r from-white/[0.03] to-white/[0.01] hover:from-amber-600 hover:to-amber-700 border border-white/[0.06] text-zinc-300 hover:text-zinc-950 rounded-xl font-bold text-xs flex items-center justify-between transition active:scale-95 shadow cursor-pointer text-left"
                 >
                   <div className="flex items-center gap-2">
                     {opt.icon && <span>{opt.icon}</span>}
@@ -4146,12 +4605,12 @@ export default function GameBoard({
                     if (abilityPromptResolverRef.current) abilityPromptResolverRef.current(opt.id);
                     setAbilityPrompt(null);
                   }}
-                  className="p-2 bg-zinc-950/80 hover:bg-amber-950/80 border border-zinc-800 hover:border-amber-400 rounded-xl flex items-center gap-2.5 transition active:scale-95 cursor-pointer shadow text-left"
+                  className="p-2 bg-white/[0.03] hover:bg-amber-500/10 border border-white/[0.06] hover:border-amber-500/40 rounded-xl flex items-center gap-2.5 transition active:scale-95 cursor-pointer shadow text-left"
                 >
                   {opt.imageUrl ? (
-                    <img src={opt.imageUrl} alt={opt.label} className="w-8 h-11 object-cover rounded border border-zinc-700 shrink-0" />
+                    <img src={opt.imageUrl} alt={opt.label} className="w-8 h-11 object-cover rounded border border-white/[0.08] shrink-0" />
                   ) : (
-                    <span className="w-8 h-11 bg-zinc-900 rounded border border-zinc-700 flex items-center justify-center text-xs shrink-0">🃏</span>
+                    <span className="w-8 h-11 bg-white/[0.04] rounded border border-white/[0.08] flex items-center justify-center text-xs shrink-0">🃏</span>
                   )}
                   <div className="flex-1 min-w-0">
                     <span className="text-xs font-bold text-zinc-200 block truncate">{opt.label}</span>
@@ -4182,7 +4641,7 @@ export default function GameBoard({
                     }
                   }}
                   placeholder="Buscar carta a nombrar..."
-                  className="w-full pl-8 pr-3 py-1.5 bg-zinc-950 border border-amber-900/50 rounded-xl text-zinc-100 text-xs focus:outline-none focus:border-amber-500"
+                  className="w-full pl-8 pr-3 py-1.5 bg-white/[0.04] border border-white/[0.08] rounded-xl text-zinc-100 text-xs focus:outline-none focus:border-amber-500/40"
                 />
               </div>
               {nameCardSearch.trim() && (
@@ -4208,7 +4667,7 @@ export default function GameBoard({
                     setAbilityPrompt(null);
                     setNameCardSearch('');
                   }}
-                  className="flex flex-col items-center bg-zinc-950/80 border border-zinc-800 hover:border-amber-500 p-1.5 rounded-xl transition active:scale-95 shadow text-center"
+                  className="flex flex-col items-center bg-white/[0.03] border border-white/[0.06] hover:border-amber-500/40 p-1.5 rounded-xl transition active:scale-95 shadow text-center"
                 >
                   {cardItem.imageUrl && (
                     <img src={cardItem.imageUrl} alt={cardItem.name} className="w-full aspect-[2.5/3.5] object-cover rounded mb-1 bg-zinc-900" />
@@ -4317,9 +4776,9 @@ export default function GameBoard({
     };
 
     return (
-      <div className="fixed inset-0 z-[9999] bg-black/85 backdrop-blur-md flex items-center justify-center p-4">
-        <div className="w-full max-w-3xl max-h-[92dvh] bg-[#120d08] border-2 border-amber-500 rounded-2xl shadow-2xl p-3 sm:p-4 flex flex-col justify-between overflow-hidden safe-area-paddings">
-          <div className="flex items-center justify-between mb-4 pb-3 border-b border-amber-800/40">
+      <div className="fixed inset-0 z-[9999] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4">
+        <div className="w-full max-w-3xl max-h-[92dvh] bg-[#0a0c10]/95 backdrop-blur-xl border border-white/[0.08] rounded-2xl shadow-[0_8px_40px_rgba(0,0,0,0.8)] p-3 sm:p-4 flex flex-col justify-between overflow-hidden safe-area-paddings">
+          <div className="flex items-center justify-between mb-4 pb-3 border-b border-white/[0.06]">
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-xl">🌟</span>
@@ -4337,7 +4796,7 @@ export default function GameBoard({
             </div>
             <button
               onClick={() => setSignoAmarilloModal(null)}
-              className="p-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white transition"
+              className="p-2 rounded-xl bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white transition"
             >
               <X className="w-5 h-5" />
             </button>
@@ -4352,16 +4811,16 @@ export default function GameBoard({
                 return (
                   <div
                     key={`signo-${cId}-${idx}`}
-                    className={`relative bg-zinc-950 rounded-2xl p-2 border-2 transition-all flex flex-col items-center ${
+                    className={`relative bg-white/[0.02] rounded-2xl p-2 border transition-all flex flex-col items-center ${
                       dest === 'HAND'
-                        ? 'border-emerald-500 shadow-lg shadow-emerald-500/20 bg-emerald-950/20'
+                        ? 'border-emerald-500/50 shadow-lg shadow-emerald-500/10 bg-emerald-500/5'
                         : dest === 'GRAVE'
-                        ? 'border-red-500 shadow-lg shadow-red-500/20 bg-red-950/20'
+                        ? 'border-red-500/50 shadow-lg shadow-red-500/10 bg-red-500/5'
                         : dest === 'TOP'
-                        ? 'border-blue-500 shadow-lg shadow-blue-500/20 bg-blue-950/20'
+                        ? 'border-blue-500/50 shadow-lg shadow-blue-500/10 bg-blue-500/5'
                         : dest === 'BOTTOM'
-                        ? 'border-purple-500 shadow-lg shadow-purple-500/20 bg-purple-950/20'
-                        : 'border-zinc-800 hover:border-amber-500/50'
+                        ? 'border-purple-500/50 shadow-lg shadow-purple-500/10 bg-purple-500/5'
+                        : 'border-white/[0.06] hover:border-amber-500/30'
                     }`}
                   >
                     <div className="w-full aspect-[2/3] rounded-xl overflow-hidden bg-black mb-2 flex items-center justify-center">
@@ -4432,13 +4891,13 @@ export default function GameBoard({
           </div>
 
           {/* Resumen y Botón de Confirmación */}
-          <div className="mt-4 pt-3 border-t border-zinc-800 flex flex-col sm:flex-row items-center justify-between gap-3">
+          <div className="mt-4 pt-3 border-t border-white/[0.06] flex flex-col sm:flex-row items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-3 text-xs">
               <span
                 className={`px-2 py-1 rounded-lg font-bold ${
                   toHandId
-                    ? 'bg-emerald-950 text-emerald-300 border border-emerald-700'
-                    : 'bg-zinc-900 text-zinc-500'
+                    ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                    : 'bg-white/[0.03] text-zinc-500'
                 }`}
               >
                 🖐️ Mano:{' '}
@@ -4447,8 +4906,8 @@ export default function GameBoard({
               <span
                 className={`px-2 py-1 rounded-lg font-bold ${
                   toGraveId
-                    ? 'bg-red-950 text-red-300 border border-red-700'
-                    : 'bg-zinc-900 text-zinc-500'
+                    ? 'bg-red-500/10 text-red-400 border border-red-500/20'
+                    : 'bg-white/[0.03] text-zinc-500'
                 }`}
               >
                 💀 Cementerio:{' '}
@@ -4458,8 +4917,8 @@ export default function GameBoard({
               <span
                 className={`px-2 py-1 rounded-lg font-bold ${
                   toTopIds.length > 0
-                    ? 'bg-blue-950 text-blue-300 border border-blue-700'
-                    : 'bg-zinc-900 text-zinc-500'
+                    ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20'
+                    : 'bg-white/[0.03] text-zinc-500'
                 }`}
               >
                 ⬆️ Tope ({toTopIds.length})
@@ -4467,8 +4926,8 @@ export default function GameBoard({
               <span
                 className={`px-2 py-1 rounded-lg font-bold ${
                   toBottomIds.length > 0
-                    ? 'bg-purple-950 text-purple-300 border border-purple-700'
-                    : 'bg-zinc-900 text-zinc-500'
+                    ? 'bg-purple-500/10 text-purple-400 border border-purple-500/20'
+                    : 'bg-white/[0.03] text-zinc-500'
                 }`}
               >
                 ⬇️ Fondo ({toBottomIds.length})
@@ -4482,7 +4941,7 @@ export default function GameBoard({
                 className={`flex-1 sm:flex-initial px-6 py-2.5 rounded-xl font-black text-xs uppercase tracking-wider transition ${
                   canConfirm
                     ? 'bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-zinc-950 shadow-lg shadow-amber-500/20 cursor-pointer'
-                    : 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
+                    : 'bg-white/[0.05] text-zinc-500 cursor-not-allowed'
                 }`}
               >
                 Confirmar y Aplicar
@@ -5367,6 +5826,207 @@ export default function GameBoard({
               {drawnCardAnim.cards.map((c: any) => c.name || 'Carta').join(' • ')}
             </strong>
           </span>
+        </div>
+      </div>
+    );
+  };
+
+  // =========================================================
+  // EJECUCIÓN Y ANIMACIÓN PÚBLICA DE BÚSQUEDA/REVELACIÓN PROGRESIVA DESDE CASTILLO
+  // =========================================================
+
+  const executeCastleRevealSearch = (config: {
+    cardTitle: string;
+    targetCriteriaText: string;
+    targetType?: string;
+    targetCount: number;
+    destinationZone?: 'hand' | 'goldZone' | 'graveyard';
+  }) => {
+    const targetType = config.targetType || 'Oro';
+    const targetCount = config.targetCount || 2;
+    const destZone = config.destinationZone || 'hand';
+
+    const deckCopy = [...castleCards];
+    const revealed: any[] = [];
+    const matched: any[] = [];
+    const unmatched: any[] = [];
+
+    while (deckCopy.length > 0 && matched.length < targetCount) {
+      const card = deckCopy.shift()!;
+      const isMatch = String(card.type || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').includes(
+        targetType.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      );
+      revealed.push({
+        ...card,
+        isMatch
+      });
+      if (isMatch) {
+        matched.push(card);
+      } else {
+        unmatched.push(card);
+      }
+    }
+
+    // Actualizar castillo y zona destino
+    const remainingDeck = [...deckCopy, ...unmatched];
+    // Barajar
+    for (let i = remainingDeck.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [remainingDeck[i], remainingDeck[j]] = [remainingDeck[j], remainingDeck[i]];
+    }
+
+    setCastleCards(remainingDeck);
+    if (destZone === 'hand') {
+      setHand((prev: any[]) => [...prev, ...matched.map((c) => ({ ...c, zone: 'HAND', isRested: false }))]);
+    } else if (destZone === 'goldZone') {
+      setGoldZone((prev: any[]) => [...prev, ...matched.map((c) => ({ ...c, zone: 'GOLD', isRested: false }))]);
+    }
+
+    const sequencePayload = {
+      sourcePlayerId: myPlayerId || 'player',
+      sourcePlayerName: currentUser?.username || 'Jugador',
+      cardTitle: config.cardTitle,
+      targetCriteriaText: config.targetCriteriaText,
+      revealedCards: revealed,
+      matchedCount: matched.length,
+      totalTargetCount: targetCount,
+      destinationZone: destZone,
+      completed: matched.length >= targetCount
+    };
+
+    setCastleRevealSequence(sequencePayload);
+    setRevealedStepIndex(1);
+
+    if (isMultiplayer && socket) {
+      socket.emit('CASTLE_REVEAL_SEQUENCE', sequencePayload);
+    }
+  };
+
+  const renderCastleRevealSequenceModal = () => {
+    if (!castleRevealSequence) return null;
+
+    const currentMatches = castleRevealSequence.revealedCards.slice(0, revealedStepIndex).filter((c) => c.isMatch).length;
+    const isFinished = revealedStepIndex >= castleRevealSequence.revealedCards.length;
+
+    return (
+      <div className="fixed inset-0 z-[10005] bg-black/90 backdrop-blur-2xl flex items-center justify-center p-4">
+        <div
+          className="w-full max-w-4xl bg-gradient-to-b from-zinc-900/98 via-zinc-950/98 to-black/98 border border-amber-500/40 rounded-3xl shadow-[0_0_50px_rgba(245,158,11,0.25)] p-6 flex flex-col max-h-[90vh] relative overflow-hidden"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Glow de fondo */}
+          <div className="absolute -top-24 -left-24 w-72 h-72 bg-amber-500/15 rounded-full blur-3xl pointer-events-none" />
+          <div className="absolute -bottom-24 -right-24 w-72 h-72 bg-amber-600/15 rounded-full blur-3xl pointer-events-none" />
+
+          {/* Encabezado */}
+          <div className="flex items-center justify-between mb-4 border-b border-amber-500/20 pb-3">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-xl shadow-inner">
+                🏰
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] bg-amber-500/20 text-amber-300 font-black px-2 py-0.5 rounded-full border border-amber-500/30 uppercase tracking-widest">
+                    Revelación Pública en Vivo
+                  </span>
+                  <span className="text-xs text-zinc-400 font-semibold">
+                    Castillo de <strong className="text-amber-200">{castleRevealSequence.sourcePlayerName}</strong>
+                  </span>
+                </div>
+                <h2 className="text-xl font-black text-transparent bg-clip-text bg-gradient-to-r from-amber-200 via-amber-400 to-amber-100 uppercase tracking-wide mt-0.5">
+                  {castleRevealSequence.cardTitle}
+                </h2>
+              </div>
+            </div>
+
+            {/* Contador de Búsqueda */}
+            <div className="flex flex-col items-end">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-black text-zinc-400 uppercase tracking-wider">Progreso:</span>
+                <span className="text-lg font-black text-amber-300">
+                  {Math.min(castleRevealSequence.totalTargetCount, currentMatches)} / {castleRevealSequence.totalTargetCount} {castleRevealSequence.targetCriteriaText}
+                </span>
+              </div>
+              <div className="w-36 h-2 bg-zinc-950 rounded-full overflow-hidden border border-zinc-800 mt-1">
+                <div
+                  className="bg-gradient-to-r from-amber-500 to-amber-300 h-full transition-all duration-300"
+                  style={{
+                    width: `${Math.min(100, (currentMatches / castleRevealSequence.totalTargetCount) * 100)}%`
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Zona de Revelación de Cartas */}
+          <div className="flex-1 overflow-y-auto min-h-[280px] p-2 flex flex-col justify-center">
+            <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-7 gap-3">
+              {castleRevealSequence.revealedCards.slice(0, revealedStepIndex).map((card, idx) => (
+                <div
+                  key={`reveal-step-${card.instanceId || card.cardId || 'c'}-${idx}`}
+                  className={`relative aspect-[2/3] rounded-2xl overflow-hidden border transition-all duration-500 flex flex-col ${
+                    card.isMatch
+                      ? 'border-emerald-400/90 shadow-[0_0_25px_rgba(16,185,129,0.5)] ring-2 ring-emerald-400/40 scale-105 z-10'
+                      : 'border-zinc-700/60 opacity-60 grayscale-[40%] hover:opacity-100 hover:grayscale-0'
+                  }`}
+                >
+                  {card.imageUrl ? (
+                    <img src={card.imageUrl} alt={card.name || 'Carta'} className="w-full h-full object-cover" />
+                  ) : (
+                    <div className="w-full h-full bg-zinc-950 flex flex-col items-center justify-center p-2 text-center">
+                      <span className="text-[10px] font-black text-amber-200">{card.name}</span>
+                      <span className="text-[9px] text-zinc-400 mt-1 uppercase">{card.type}</span>
+                    </div>
+                  )}
+
+                  {/* Badge de coincidencia */}
+                  <div
+                    className={`absolute top-1.5 inset-x-1.5 px-1.5 py-0.5 rounded-lg text-[9px] font-black uppercase text-center shadow-lg backdrop-blur-md ${
+                      card.isMatch
+                        ? 'bg-emerald-500/90 text-zinc-950 border border-emerald-300'
+                        : 'bg-zinc-900/90 text-zinc-400 border border-zinc-700'
+                    }`}
+                  >
+                    {card.isMatch ? `✓ Cumple (${card.type})` : `✕ No (${card.type})`}
+                  </div>
+
+                  {/* Orden de extracción */}
+                  <div className="absolute bottom-1 left-1.5 bg-black/80 px-1.5 py-0.5 rounded text-[8px] font-black text-zinc-300">
+                    #{idx + 1}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Banner de Finalización y Acciones */}
+          <div className="mt-4 pt-3 border-t border-zinc-800 flex items-center justify-between">
+            <div className="text-xs text-zinc-400">
+              {!isFinished ? (
+                <span className="flex items-center gap-2 text-amber-400 font-bold animate-pulse">
+                  <span className="w-2 h-2 rounded-full bg-amber-400" />
+                  Examinando carta #{revealedStepIndex}...
+                </span>
+              ) : (
+                <span className="text-emerald-400 font-black flex items-center gap-1.5">
+                  <span>✓</span> Búsqueda completada ({castleRevealSequence.matchedCount} de {castleRevealSequence.totalTargetCount} encontrados en {castleRevealSequence.revealedCards.length} cartas).
+                </span>
+              )}
+            </div>
+
+            <button
+              onClick={() => {
+                if (!isFinished) {
+                  setRevealedStepIndex(castleRevealSequence.revealedCards.length);
+                } else {
+                  setCastleRevealSequence(null);
+                }
+              }}
+              className="px-5 py-2 rounded-xl bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-zinc-950 font-black text-xs uppercase tracking-wider transition shadow-lg shadow-amber-500/20 active:scale-95"
+            >
+              {!isFinished ? 'Saltar Animación' : 'Entendido'}
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -6285,21 +6945,15 @@ export default function GameBoard({
 
         const sent =
           sendGameAction({
-
-            type:
-              'PLAY_CARD',
-
-            cardInstanceId:
-              String(
-                card.instanceId
-              ),
-
+            type: 'PLAY_CARD',
+            action: 'PLAY_CARD',
+            instanceId: String(card.instanceId || card.cardId || card.id || ''),
+            cardInstanceId: String(card.instanceId || card.cardId || card.id || ''),
+            cardId: String(card.cardId || card.id || ''),
+            cardName: card.name,
             paidGoldIds,
-
             isResponse,
-
-            namedCard:
-              namedCardResult
+            namedCard: namedCardResult
           });
 
         if (!sent) {
@@ -6756,12 +7410,13 @@ export default function GameBoard({
     // ORO
     // =======================================================
     if (masterData.type === 'Oro') {
-      // Límite: solo 1 Oro por turno desde la mano (modo local) o penalización de Escarapela
-      if (!isMultiplayer && (goldPlayedFromHandThisTurn || cannotPlayGoldNextTurn)) {
-        alert('No puedes bajar un Oro este turno (límite de 1 Oro por turno o efecto de Escarapela Nacional).');
+      // Límite estricto: solo 1 Oro por turno desde la mano (en todos los modos) o penalización de Escarapela
+      if (goldPlayedFromHandThisTurn || cannotPlayGoldNextTurn) {
+        showNotice('⚠️ No puedes bajar más de 1 Oro por turno desde tu mano (Regla Oficial).', 'warning');
         return;
       }
 
+      setGoldPlayedFromHandThisTurn(true);
       void executePlayCard(card, []);
       return;
     }
@@ -6892,27 +7547,8 @@ export default function GameBoard({
       .replace(/[\u0300-\u036f]/g, '')
       .trim();
 
-    // Comprobar si la carta tiene una habilidad activable en campo
-    const entry = AbilityInterpreter.getEntry(card);
-    const triggers = entry?.analysis?.triggers || [];
-    const hasActivatedTrigger = triggers.some((t: any) =>
-      t.type === 'ACTIVATED_VIGILIA' ||
-      t.type === 'ACTIVATED_ONCE_PER_TURN' ||
-      t.type === 'IN_RESPONSE' ||
-      t.type === 'FINAL_PHASE_TRIGGER'
-    );
-
-    const hasActivatedKeywords = /una vez por turno|en tu vigilia|en vigilia|puedes desterrar|puedes destruir|puedes pagar|barajando|en respuesta|puedes convertir|en tu fase final/i.test(abText);
-    const hasSpecificActive = ['torre de babel', 'armeria del guerrero', 'jinete de la peste', 'escamas de dragon', 'lanza argenta', 'cthulhu'].includes(normName);
-
-    const isPureEtbOrPassive = !hasActivatedTrigger && !hasActivatedKeywords && !hasSpecificActive;
-
-    if (isPureEtbOrPassive) {
-      showNotice(`"${card.name}" solo tiene efectos automáticos / continuos y no posee una habilidad activable manual en campo.`, 'info');
-      return;
-    }
-
     // Validación Central de Habilidades según el DAR
+    const isUsed = usedAbilityCardIdsThisTurn.includes(card.instanceId) || usedAbilityCardIdsThisTurn.includes(card.id);
     const abilityValidation = canActivateAbility({
       card,
       playerSide: 'player',
@@ -6920,7 +7556,7 @@ export default function GameBoard({
       currentPhaseIndex,
       isResponseWindow: isMultiplayer ? (responseWindow && !isMyTurn) : false,
       hasPriority: isMultiplayer ? (isMyTurn || responseWindow) : true,
-      usedThisTurn: usedAbilityCardIdsThisTurn.includes(card.instanceId || card.id),
+      usedThisTurn: isUsed,
       isSilenced: card.isAbilityDisabled || card.isSilenced || card.sinHabilidad || card.convertedToVanilla,
       gameState: { defenseZone, attackZone, totemZone, goldZone }
     });
@@ -6931,18 +7567,6 @@ export default function GameBoard({
     }
 
     const cardId = card.instanceId || card.id;
-    setUsedAbilityCardIdsThisTurn((prev) => [...prev, cardId]);
-
-    // Trigger visual ability activation pulse
-    setActivatingAbilityCardId(card.instanceId);
-    setTimeout(() => {
-      setActivatingAbilityCardId(null);
-    }, 1200);
-
-    // Resting the card upon ability use
-    setDefenseZone((prev: any[]) => prev.map((c: any) => c.instanceId === card.instanceId ? { ...c, isRested: true } : c));
-    setTotemZone((prev: any[]) => prev.map((c: any) => c.instanceId === card.instanceId ? { ...c, isRested: true } : c));
-    setGoldZone((prev: any[]) => prev.map((g: any) => g.instanceId === card.instanceId ? { ...g, isRested: true } : g));
 
     if (isMultiplayer) {
       if (!isMyTurn && !canRespond) {
@@ -6953,6 +7577,10 @@ export default function GameBoard({
       const socket = multiplayerData?.socket;
       const lobbyId = multiplayerData?.lobbyData?.id || multiplayerData?.lobbyData?.lobbyId;
       if (!socket || !lobbyId) return;
+
+      setUsedAbilityCardIdsThisTurn((prev) => [...prev, cardId, card.instanceId]);
+      setActivatingAbilityCardId(card.instanceId);
+      setTimeout(() => { setActivatingAbilityCardId(null); }, 1200);
 
       socket.emit('player_action', {
         lobbyId,
@@ -6965,8 +7593,20 @@ export default function GameBoard({
       return;
     }
 
-    // Modo local / playtest
-    await executeCardAbility(card);
+    // Modo local / playtest: Solo consumir y descansar si la ejecución fue confirmada y no cancelada
+    const executed: any = await executeCardAbility(card);
+    if (executed !== false) {
+      setUsedAbilityCardIdsThisTurn((prev) => [...prev, cardId, card.instanceId]);
+      setActivatingAbilityCardId(card.instanceId);
+      setTimeout(() => { setActivatingAbilityCardId(null); }, 1200);
+
+      // Descansar carta tras uso exitoso
+      setDefenseZone((prev: any[]) => prev.map((c: any) => c.instanceId === card.instanceId ? { ...c, isRested: true } : c));
+      setTotemZone((prev: any[]) => prev.map((c: any) => c.instanceId === card.instanceId ? { ...c, isRested: true } : c));
+      setGoldZone((prev: any[]) => prev.map((g: any) => g.instanceId === card.instanceId ? { ...g, isRested: true } : g));
+    } else {
+      showNotice(`Cancelaste la habilidad de "${card.name}". No se consumió el uso por turno ni se descansó.`, 'info');
+    }
   };
 
   // =========================================================
@@ -7078,13 +7718,10 @@ export default function GameBoard({
         }
 
         sendGameAction({
-
-          type:
-            'TOGGLE_REST',
-
-          cardInstanceId:
-            card.instanceId,
-
+          type: 'TOGGLE_REST',
+          action: 'TOGGLE_REST',
+          instanceId: card.instanceId,
+          cardInstanceId: card.instanceId,
           zone
         });
 
@@ -7313,12 +7950,10 @@ export default function GameBoard({
       }
 
       sendGameAction({
-
-        type:
-          'DECLARE_ATTACK',
-
-        cardInstanceId:
-          card.instanceId
+        type: 'DECLARE_ATTACK',
+        action: 'DECLARE_ATTACK',
+        instanceId: card.instanceId,
+        cardInstanceId: card.instanceId
       });
 
       return;
@@ -7386,6 +8021,8 @@ export default function GameBoard({
     if (isMultiplayer) {
       sendGameAction({
         type: 'CANCEL_ATTACK',
+        action: 'CANCEL_ATTACK',
+        instanceId: card.instanceId,
         cardInstanceId: card.instanceId
       });
       return;
@@ -7411,7 +8048,7 @@ export default function GameBoard({
     });
   };
 
-  const declareBlock = (
+  const declareBlock = async (
     attackerCard: any,
     blockerCard: any
   ) => {
@@ -7431,6 +8068,19 @@ export default function GameBoard({
         ...prev,
         [attackerCard.instanceId]: blockerCard.instanceId
       }));
+
+      // Trigger reactivo de Bloqueo (onDeclareBlock)
+      const bNorm = String(blockerCard.name || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      const bAb = String(blockerCard.ability || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+      if (bNorm.includes('figol el druida') || (bAb.includes('declarado bloqueador') && bAb.includes('vuelven a la linea de defensa'))) {
+        showNotice(`🛡️ ¡${blockerCard.name} fue declarado bloqueador! Todos los atacantes vuelven a la Línea de Defensa.`, 'warning');
+        setAttackZone([]);
+        setDefenseZone((prev: any[]) => [...prev, ...attackZone.map((a: any) => ({ ...a, zone: 'DEFENSE', isRested: false }))]);
+        setLocalCombatBlocks({});
+      } else if (bAb.includes('declarado bloqueador') || bAb.includes('al bloquear')) {
+        await executeCardAbility(blockerCard, false, { trigger: 'ON_DECLARE_BLOCK' });
+      }
     }
     setBlockTargetingAttacker(null);
   };
@@ -7516,23 +8166,33 @@ export default function GameBoard({
           isRested: true,
           canAttack: false
         });
+
+        // Disparo reactivo onDealCombatDamageToDeck
+        const atkAb = String(attacker.ability || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        if (atkAb.includes('dano al castillo') || atkAb.includes('dano de combate') || atkAb.includes('haga dano') || atkAb.includes('haga 1 o mas de dano')) {
+          void executeCardAbility(attacker, false, { trigger: 'ON_DEAL_COMBAT_DAMAGE' });
+        }
       } else {
         // 2. Combate de Fuerza (Atacante vs Bloqueador)
         const fBlocker = getCardEffectiveStrength(blocker);
 
         if (fAttacker > fBlocker) {
-          // Destruye al defensor y pasa daño sobrante al Castillo
+          // Destruye al defensor (si no es Indestructible) y pasa daño sobrante al Castillo
           const excess = fAttacker - fBlocker;
           totalCastleDamage += excess;
-          if (typeof setOpponentGraveyard === 'function') {
-            setOpponentGraveyard((prev: any[]) => [...(prev || []), blocker]);
-            setRecentOpponentGraveyardCards((prev: any[]) => [blocker, ...prev]);
-            setTimeout(() => setRecentOpponentGraveyardCards([]), 10000);
-          }
-          if (typeof setOpponentDefenseZone === 'function') {
-            setOpponentDefenseZone((prev: any[]) =>
-              (prev || []).filter((c: any) => c.instanceId !== blocker.instanceId)
-            );
+          if (!isIndestructible(blocker)) {
+            if (typeof setOpponentGraveyard === 'function') {
+              setOpponentGraveyard((prev: any[]) => [...(prev || []), blocker]);
+              setRecentOpponentGraveyardCards((prev: any[]) => [blocker, ...prev]);
+              setTimeout(() => setRecentOpponentGraveyardCards([]), 10000);
+            }
+            if (typeof setOpponentDefenseZone === 'function') {
+              setOpponentDefenseZone((prev: any[]) =>
+                (prev || []).filter((c: any) => c.instanceId !== blocker.instanceId)
+              );
+            }
+          } else {
+            showNotice(`🛡️ ${blocker.name} es Indestructible: sobrevivió al combate en defensa.`, 'warning');
           }
           survivingAttackers.push({
             ...attacker,
@@ -7540,21 +8200,45 @@ export default function GameBoard({
             canAttack: false
           });
         } else if (fAttacker === fBlocker) {
-          // Empate: ambos destruidos
-          setGraveyard((prev: any[]) => [...(prev || []), attacker]);
-          if (typeof setOpponentGraveyard === 'function') {
-            setOpponentGraveyard((prev: any[]) => [...(prev || []), blocker]);
-            setRecentOpponentGraveyardCards((prev: any[]) => [blocker, ...prev]);
-            setTimeout(() => setRecentOpponentGraveyardCards([]), 10000);
+          // Empate: ambos destruidos a menos que sean Indestructibles
+          if (!isIndestructible(attacker)) {
+            setGraveyard((prev: any[]) => [...(prev || []), attacker]);
+          } else {
+            survivingAttackers.push({
+              ...attacker,
+              isRested: true,
+              canAttack: false
+            });
+            showNotice(`🛡️ ${attacker.name} es Indestructible: no fue destruido por empate de combate.`, 'warning');
           }
-          if (typeof setOpponentDefenseZone === 'function') {
-            setOpponentDefenseZone((prev: any[]) =>
-              (prev || []).filter((c: any) => c.instanceId !== blocker.instanceId)
-            );
+
+          if (!isIndestructible(blocker)) {
+            if (typeof setOpponentGraveyard === 'function') {
+              setOpponentGraveyard((prev: any[]) => [...(prev || []), blocker]);
+              setRecentOpponentGraveyardCards((prev: any[]) => [blocker, ...prev]);
+              setTimeout(() => setRecentOpponentGraveyardCards([]), 10000);
+            }
+            if (typeof setOpponentDefenseZone === 'function') {
+              setOpponentDefenseZone((prev: any[]) =>
+                (prev || []).filter((c: any) => c.instanceId !== blocker.instanceId)
+              );
+            }
+          } else {
+            showNotice(`🛡️ ${blocker.name} es Indestructible: sobrevivió al empate en defensa.`, 'warning');
           }
         } else {
-          // Defensor gana: atacante destruido, defensor descansa
-          setGraveyard((prev: any[]) => [...(prev || []), attacker]);
+          // Defensor gana: atacante destruido (si no es Indestructible), defensor descansa
+          if (!isIndestructible(attacker)) {
+            setGraveyard((prev: any[]) => [...(prev || []), attacker]);
+          } else {
+            survivingAttackers.push({
+              ...attacker,
+              isRested: true,
+              canAttack: false
+            });
+            showNotice(`🛡️ ${attacker.name} es Indestructible: no fue destruido por combate.`, 'warning');
+          }
+
           if (typeof setOpponentDefenseZone === 'function') {
             setOpponentDefenseZone((prev: any[]) =>
               (prev || []).map((c: any) =>
@@ -7736,47 +8420,20 @@ export default function GameBoard({
   // OROS
   // =========================================================
 
-  const paidGolds =
-    (
-      goldZone || []
-    ).filter(
-      (gold: any) =>
-        gold.isRested
-    );
+  const isGoldPaid = (gold: any) => Boolean(gold?.isRested || gold?.exhausted || gold?.data?.isPaid || gold?.isPaid);
 
-  const reserveGolds =
-    (
-      goldZone || []
-    ).filter(
-      (gold: any) =>
-        !gold.isRested
-    );
+  const paidGolds = (goldZone || []).filter((gold: any) => isGoldPaid(gold));
+  const reserveGolds = (goldZone || []).filter((gold: any) => !isGoldPaid(gold));
+  const paidGoldCount = paidGolds.length;
+  const reserveGoldCount = reserveGolds.length;
 
-  const paidGoldCount =
-    paidGolds.length;
-
-  const reserveGoldCount =
-    reserveGolds.length;
-
-  const opponentPaidGolds =
-    (
-      opponentGoldZone || []
-    ).filter(
-      (gold: any) =>
-        gold.isRested
-    );
-
-  const opponentReserveGolds =
-    (
-      opponentGoldZone || []
-    ).filter(
-      (gold: any) =>
-        !gold.isRested
-    );
+  const opponentPaidGolds = (opponentGoldZone || []).filter((gold: any) => isGoldPaid(gold));
+  const opponentReserveGolds = (opponentGoldZone || []).filter((gold: any) => !isGoldPaid(gold));
 
   const checkCanActivateAbility = useCallback((card: any) => {
     if (!card || !card.ability) return false;
     const cardId = card.instanceId || card.id;
+    const isUsed = usedAbilityCardIdsThisTurn.includes(cardId) || (card.instanceId && usedAbilityCardIdsThisTurn.includes(card.instanceId)) || (card.id && usedAbilityCardIdsThisTurn.includes(card.id));
     return canActivateAbility({
       card,
       playerSide: 'player',
@@ -7784,7 +8441,7 @@ export default function GameBoard({
       currentPhaseIndex,
       isResponseWindow: isMultiplayer ? (responseWindow && !isMyTurn) : false,
       hasPriority: isMultiplayer ? (isMyTurn || responseWindow) : true,
-      usedThisTurn: usedAbilityCardIdsThisTurn.includes(cardId),
+      usedThisTurn: Boolean(isUsed),
       isSilenced: card.isAbilityDisabled || card.isSilenced || card.sinHabilidad || card.convertedToVanilla,
       gameState: { defenseZone, attackZone, totemZone, goldZone }
     }).legal;
@@ -7818,7 +8475,7 @@ export default function GameBoard({
 
   return (
 
-    <div className="flex-1 flex h-screen bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-[#26180e] via-[#120d09] to-[#080504] text-amber-100 font-sans relative overflow-hidden select-none safe-area-paddings">
+    <div className="flex-1 flex h-screen bg-[radial-gradient(ellipse_at_center,_#1a1e28_0%,_#0d0f14_50%,_#050508_100%)] text-zinc-200 font-sans relative overflow-hidden select-none safe-area-paddings">
 
       {/* VFX Layer (Floating buffs, debuffs, gold particles, non-blocking) */}
       <VFXLayer events={vfxEvents} />
@@ -7857,6 +8514,7 @@ export default function GameBoard({
       {renderPulsoKaijuModal()}
       {renderHandSelectionModal()}
       {renderDrawCardAnimation()}
+      {renderCastleRevealSequenceModal()}
 
       {/* =====================================================
           POPUP CARTA
@@ -7891,9 +8549,9 @@ export default function GameBoard({
             }}
           >
 
-            <div className="bg-zinc-950/98 border-2 border-amber-500/80 rounded-2xl p-2 shadow-2xl">
+            <div className="bg-[#0a0c10]/95 backdrop-blur-xl border border-white/[0.08] rounded-2xl p-2 shadow-[0_8px_40px_rgba(0,0,0,0.7)]">
 
-              <div className="bg-black/60 rounded-xl border border-amber-900/40 p-1.5 flex justify-center">
+              <div className="bg-black/40 rounded-xl border border-white/[0.04] p-1.5 flex justify-center">
 
                 <img
                   src={
@@ -7908,15 +8566,15 @@ export default function GameBoard({
 
               </div>
 
-              <div className="mt-2 bg-zinc-900 rounded-xl border border-zinc-800 p-2">
+              <div className="mt-2 bg-white/[0.03] rounded-xl border border-white/[0.06] p-2">
 
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm font-black text-amber-300">
+                  <span className="text-sm font-black text-zinc-100">
                     {hoveredCard.name}
                   </span>
                   {hoveredCard.cost !== undefined && hoveredCard.cost !== null && (
-                    <div className="w-8 h-8 rounded-full bg-amber-900/60 border-2 border-amber-500/80 flex items-center justify-center flex-shrink-0">
-                      <span className="text-amber-300 font-black text-base">{hoveredCard.cost}</span>
+                    <div className="w-8 h-8 rounded-full bg-[#1a1a24] border border-amber-500/40 flex items-center justify-center flex-shrink-0 shadow-[0_0_12px_rgba(245,158,11,0.15)]">
+                      <span className="text-amber-400 font-black text-base">{hoveredCard.cost}</span>
                     </div>
                   )}
                 </div>
@@ -7924,7 +8582,7 @@ export default function GameBoard({
                 <div className="flex items-center gap-2 mt-1 ml-10">
 
                   {hoveredCard.type && (
-                    <span className="text-[9px] uppercase font-bold text-zinc-400">
+                    <span className="text-[9px] uppercase font-bold text-zinc-500">
                       {hoveredCard.type}
                     </span>
                   )}
@@ -7932,7 +8590,7 @@ export default function GameBoard({
                   {getCardRaces && getCardRaces(hoveredCard)?.length > 0 && (
                     <>
                       <span className="text-zinc-700">-</span>
-                      <span className="text-[9px] uppercase font-bold text-amber-500/80">
+                      <span className="text-[9px] uppercase font-bold text-amber-500/60">
                         {getCardRaces(hoveredCard).join(' / ')}
                       </span>
                     </>
@@ -7946,7 +8604,7 @@ export default function GameBoard({
                     hoveredCard
                   ) && (
 
-                    <span className="flex items-center gap-1 px-2 py-1 rounded-md bg-red-950 border border-red-500/50 text-[8px] font-black text-red-300 uppercase">
+                    <span className="flex items-center gap-1 px-2 py-1 rounded-md bg-red-500/10 border border-red-500/20 text-[8px] font-black text-red-400 uppercase">
 
                       <Zap className="w-2.5 h-2.5" />
 
@@ -7960,7 +8618,7 @@ export default function GameBoard({
                     hoveredCard
                   ) && (
 
-                    <span className="flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-950 border border-emerald-500/50 text-[8px] font-black text-emerald-300 uppercase">
+                    <span className="flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-500/10 border border-emerald-500/20 text-[8px] font-black text-emerald-400 uppercase">
 
                       <Shield className="w-2.5 h-2.5" />
 
@@ -7974,7 +8632,7 @@ export default function GameBoard({
                     hoveredCard
                   ) && (
 
-                    <span className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-950 border border-blue-500/50 text-[8px] font-black text-blue-300 uppercase">
+                    <span className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-500/10 border border-blue-500/20 text-[8px] font-black text-blue-400 uppercase">
 
                       <Ban className="w-2.5 h-2.5" />
 
@@ -7990,7 +8648,7 @@ export default function GameBoard({
                 {(hoveredCard.type === 'Aliado' || (hoveredCard.type === 'Hechizo' && hoveredCard.strength !== undefined)) && (
                   <div className="mt-2 flex gap-1.5">
                     {hoveredCard.type === 'Aliado' && (
-                      <div className="flex-1 p-1.5 rounded-lg bg-zinc-950/80 border border-zinc-800 text-center">
+                      <div className="flex-1 p-1.5 rounded-lg bg-white/[0.03] border border-white/[0.06] text-center">
                         <span className="text-[9px] text-zinc-500 font-bold block uppercase">Fuerza</span>
                         <div className="flex items-center justify-center gap-1">
                           <span className="text-amber-400 font-black text-sm">{getCardEffectiveStrength(hoveredCard)}</span>
@@ -8009,7 +8667,7 @@ export default function GameBoard({
                       </div>
                     )}
                     {hoveredCard.type === 'Hechizo' && hoveredCard.strength !== undefined && (
-                      <div className="flex-1 p-1.5 rounded-lg bg-zinc-950/80 border border-zinc-800 text-center">
+                      <div className="flex-1 p-1.5 rounded-lg bg-white/[0.03] border border-white/[0.06] text-center">
                         <span className="text-[9px] text-zinc-500 font-bold block uppercase">Dano</span>
                         <span className="text-red-400 font-black text-sm">{hoveredCard.strength}</span>
                       </div>
@@ -8019,9 +8677,9 @@ export default function GameBoard({
 
                 {/* Ability text */}
                 {hoveredCard.ability && (
-                  <div className="mt-2 p-2 rounded-lg bg-[#12140f] border border-amber-900/30 text-left">
-                    <span className="text-[9px] text-amber-500/70 font-bold uppercase block mb-1">Habilidad</span>
-                    <p className="text-[10px] text-zinc-300 leading-snug">{hoveredCard.ability}</p>
+                  <div className="mt-2 p-2 rounded-lg bg-white/[0.03] border border-white/[0.06] text-left">
+                    <span className="text-[9px] text-amber-500/50 font-bold uppercase block mb-1">Habilidad</span>
+                    <p className="text-[10px] text-zinc-400 leading-snug">{hoveredCard.ability}</p>
                   </div>
                 )}
 
@@ -8046,7 +8704,7 @@ export default function GameBoard({
       {showGraveyard && (
 
         <div
-          className="fixed inset-0 z-[9996] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          className="fixed inset-0 z-[9996] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4"
           onClick={() =>
             setShowGraveyard(
               false
@@ -8055,7 +8713,7 @@ export default function GameBoard({
         >
 
           <div
-            className="w-full max-w-5xl max-h-[92dvh] bg-[#140e09] p-3 sm:p-4 rounded-2xl overflow-hidden safe-area-paddings border-2 border-red-900/70 rounded-2xl shadow-2xl p-4 flex flex-col"
+            className="w-full max-w-5xl max-h-[92dvh] bg-[#0a0c10]/95 backdrop-blur-xl p-3 sm:p-4 rounded-2xl overflow-hidden safe-area-paddings border border-white/[0.08] shadow-[0_8px_40px_rgba(0,0,0,0.8)] flex flex-col"
             onClick={(event) =>
               event.stopPropagation()
             }
@@ -8065,7 +8723,7 @@ export default function GameBoard({
 
               <div>
 
-                <h2 className="text-xl font-black text-red-400 uppercase">
+                <h2 className="text-xl font-black text-red-400 uppercase tracking-wide">
                   Cementerio
                 </h2>
 
@@ -8083,7 +8741,7 @@ export default function GameBoard({
                     false
                   )
                 }
-                className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700"
+                className="p-2 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white transition"
               >
 
                 <X className="w-5 h-5" />
@@ -8139,7 +8797,7 @@ export default function GameBoard({
                           handleCardLeave
                         }
 
-                        className="relative aspect-[2/3] rounded-xl overflow-hidden border border-red-900/60 bg-zinc-950 shadow-lg hover:border-red-400 hover:scale-105 transition-transform cursor-pointer"
+                        className="relative aspect-[2/3] rounded-xl overflow-hidden border border-white/[0.06] bg-white/[0.02] shadow-lg hover:border-red-500/40 hover:scale-105 transition-all duration-200 cursor-pointer"
                       >
 
                         <img
@@ -8217,7 +8875,7 @@ export default function GameBoard({
       {showBanished && (
 
         <div
-          className="fixed inset-0 z-[9996] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          className="fixed inset-0 z-[9996] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4"
           onClick={() =>
             setShowBanished(
               false
@@ -8226,7 +8884,7 @@ export default function GameBoard({
         >
 
           <div
-            className="w-full max-w-5xl max-h-[92dvh] bg-[#140e09] p-3 sm:p-4 rounded-2xl overflow-hidden safe-area-paddings border-2 border-blue-900/70 rounded-2xl shadow-2xl p-4 flex flex-col"
+            className="w-full max-w-5xl max-h-[92dvh] bg-[#0a0c10]/95 backdrop-blur-xl p-3 sm:p-4 rounded-2xl overflow-hidden safe-area-paddings border border-white/[0.08] shadow-[0_8px_40px_rgba(0,0,0,0.8)] flex flex-col"
             onClick={(event) =>
               event.stopPropagation()
             }
@@ -8236,7 +8894,7 @@ export default function GameBoard({
 
               <div>
 
-                <h2 className="text-xl font-black text-blue-400 uppercase">
+                <h2 className="text-xl font-black text-blue-400 uppercase tracking-wide">
                   Destierro
                 </h2>
 
@@ -8254,7 +8912,7 @@ export default function GameBoard({
                     false
                   )
                 }
-                className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700"
+                className="p-2 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white transition"
               >
 
                 <X className="w-5 h-5" />
@@ -8310,7 +8968,7 @@ export default function GameBoard({
                           handleCardLeave
                         }
 
-                        className="relative aspect-[2/3] rounded-xl overflow-hidden border border-blue-900/60 bg-zinc-950 shadow-lg hover:border-blue-400 hover:scale-105 transition-transform cursor-pointer"
+                        className="relative aspect-[2/3] rounded-xl overflow-hidden border border-white/[0.06] bg-white/[0.02] shadow-lg hover:border-blue-500/40 hover:scale-105 transition-all duration-200 cursor-pointer"
                       >
 
                         <img
@@ -8408,16 +9066,16 @@ export default function GameBoard({
       ===================================================== */}
       {showOpponentGraveyard && (
         <div
-          className="fixed inset-0 z-[9996] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          className="fixed inset-0 z-[9996] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4"
           onClick={() => setShowOpponentGraveyard(false)}
         >
           <div
-            className="w-full max-w-5xl max-h-[92dvh] bg-[#140e09] p-3 sm:p-4 rounded-2xl overflow-hidden safe-area-paddings border-2 border-red-900/70 rounded-2xl shadow-2xl p-4 flex flex-col"
+            className="w-full max-w-5xl max-h-[92dvh] bg-[#0a0c10]/95 backdrop-blur-xl p-3 sm:p-4 rounded-2xl overflow-hidden safe-area-paddings border border-white/[0.08] shadow-[0_8px_40px_rgba(0,0,0,0.8)] flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-4">
               <div>
-                <h2 className="text-xl font-black text-red-400 uppercase">
+                <h2 className="text-xl font-black text-red-400 uppercase tracking-wide">
                   Cementerio de {opponentName}
                 </h2>
                 <p className="text-[10px] text-zinc-500 mt-1">
@@ -8426,7 +9084,7 @@ export default function GameBoard({
               </div>
               <button
                 onClick={() => setShowOpponentGraveyard(false)}
-                className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+                className="p-2 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white transition"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -8447,7 +9105,7 @@ export default function GameBoard({
                       key={`opp-grave-modal-${card.instanceId || card.id || 'card'}-${index}`}
                       onMouseEnter={(event) => handleCardHover(card, event)}
                       onMouseLeave={handleCardLeave}
-                      className="relative aspect-[2/3] rounded-xl overflow-hidden border border-red-900/60 bg-zinc-950 shadow-lg hover:border-red-400 hover:scale-105 transition-transform cursor-pointer"
+                      className="relative aspect-[2/3] rounded-xl overflow-hidden border border-white/[0.06] bg-white/[0.02] shadow-lg hover:border-red-500/40 hover:scale-105 transition-all duration-200 cursor-pointer"
                     >
                       <img
                         src={card.imageUrl}
@@ -8468,16 +9126,16 @@ export default function GameBoard({
       ===================================================== */}
       {showOpponentBanished && (
         <div
-          className="fixed inset-0 z-[9996] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          className="fixed inset-0 z-[9996] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4"
           onClick={() => setShowOpponentBanished(false)}
         >
           <div
-            className="w-full max-w-5xl max-h-[92dvh] bg-[#140e09] p-3 sm:p-4 rounded-2xl overflow-hidden safe-area-paddings border-2 border-blue-900/70 rounded-2xl shadow-2xl p-4 flex flex-col"
+            className="w-full max-w-5xl max-h-[92dvh] bg-[#0a0c10]/95 backdrop-blur-xl p-3 sm:p-4 rounded-2xl overflow-hidden safe-area-paddings border border-white/[0.08] shadow-[0_8px_40px_rgba(0,0,0,0.8)] flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-4">
               <div>
-                <h2 className="text-xl font-black text-blue-400 uppercase">
+                <h2 className="text-xl font-black text-blue-400 uppercase tracking-wide">
                   Destierro de {opponentName}
                 </h2>
                 <p className="text-[10px] text-zinc-500 mt-1">
@@ -8486,7 +9144,7 @@ export default function GameBoard({
               </div>
               <button
                 onClick={() => setShowOpponentBanished(false)}
-                className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+                className="p-2 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white transition"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -8507,7 +9165,7 @@ export default function GameBoard({
                       key={`opp-banished-modal-${card.instanceId || card.id || 'card'}-${index}`}
                       onMouseEnter={(event) => handleCardHover(card, event)}
                       onMouseLeave={handleCardLeave}
-                      className="relative aspect-[2/3] rounded-xl overflow-hidden border border-blue-900/60 bg-zinc-950 shadow-lg hover:border-blue-400 hover:scale-105 transition-transform cursor-pointer"
+                      className="relative aspect-[2/3] rounded-xl overflow-hidden border border-white/[0.06] bg-white/[0.02] shadow-lg hover:border-blue-500/40 hover:scale-105 transition-all duration-200 cursor-pointer"
                     >
                       <img
                         src={card.imageUrl}
@@ -8527,17 +9185,17 @@ export default function GameBoard({
           MODAL BÚSQUEDA EN CASTILLO ONLINE / ZONAS PÚBLICAS
       ===================================================== */}
       {onlineCastleSearch && (
-        <div className="fixed inset-0 z-[10001] bg-black/85 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-[10001] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4">
           <div
-            className="w-full max-w-5xl max-h-[85vh] bg-[#0d1722] border-2 border-cyan-500/70 rounded-2xl shadow-2xl p-4 flex flex-col"
+            className="w-full max-w-5xl max-h-[85vh] bg-[#0a0c10]/95 backdrop-blur-xl border border-white/[0.08] rounded-2xl shadow-[0_8px_40px_rgba(0,0,0,0.8)] p-4 flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-4">
               <div>
-                <span className="text-[9px] text-cyan-400 uppercase font-black">
+                <span className="text-[9px] text-cyan-400/70 uppercase font-black">
                   {onlineCastleSearch.readonly ? 'Zona pública' : 'Búsqueda online'}
                 </span>
-                <h2 className="text-xl font-black text-cyan-300 uppercase">
+                <h2 className="text-xl font-black text-cyan-300 uppercase tracking-wide">
                   {onlineCastleSearch.readonly ? onlineCastleSearch.sourceCardName : 'Buscar en Castillo'}
                 </h2>
                 <p className="text-[10px] text-zinc-500 mt-1">
@@ -8614,15 +9272,15 @@ export default function GameBoard({
 
       {showCastleSearchModal && castleSearchResolver && (
         <div
-          className="fixed inset-0 z-[9997] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          className="fixed inset-0 z-[9997] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4"
         >
           <div
-            className="w-full max-w-5xl max-h-[85vh] bg-[#0d1722] border-2 border-amber-600/70 rounded-2xl shadow-2xl p-4 flex flex-col"
+            className="w-full max-w-5xl max-h-[85vh] bg-[#0a0c10]/95 backdrop-blur-xl border border-white/[0.08] rounded-2xl shadow-[0_8px_40px_rgba(0,0,0,0.8)] p-4 flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-4">
               <div>
-                <h2 className="text-xl font-black text-amber-400 uppercase">Búsqueda en Castillo</h2>
+                <h2 className="text-xl font-black text-amber-400 uppercase tracking-wide">Búsqueda en Castillo</h2>
                 <p className="text-[10px] text-zinc-500 mt-1">
                   Selecciona una carta para añadirla a tu mano. El castillo se barajará.
                   {castleSearchFilter.type ? ` (Solo: ${castleSearchFilter.type})` : ''}
@@ -8635,7 +9293,7 @@ export default function GameBoard({
                   castleSearchResolver(null);
                   setCastleSearchResolver(null);
                 }}
-                className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700"
+                className="p-2 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white transition"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -8728,9 +9386,9 @@ export default function GameBoard({
       {showGoldModal &&
         pendingCard && (
 
-        <div className="fixed inset-0 z-[9998] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-[9998] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4">
 
-          <div className="w-full max-w-xl max-h-[92dvh] bg-[#140e09] border-2 border-amber-500/80 rounded-2xl shadow-2xl p-3 sm:p-4 flex flex-col justify-between overflow-hidden safe-area-paddings">
+          <div className="w-full max-w-xl max-h-[92dvh] bg-[#0a0c10]/95 backdrop-blur-xl border border-white/[0.08] rounded-2xl shadow-[0_8px_40px_rgba(0,0,0,0.8)] p-3 sm:p-4 flex flex-col justify-between overflow-hidden safe-area-paddings">
 
             <div className="flex items-center justify-between mb-4">
 
@@ -8756,7 +9414,7 @@ export default function GameBoard({
                   setPendingCard(null);
                   setSelectedGoldIds([]);
                 }}
-                className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700"
+                className="p-2 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white transition"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -8789,15 +9447,15 @@ export default function GameBoard({
                         )
                       }
 
-                      className={`relative aspect-[2/3] rounded-xl overflow-hidden border-2 transition-all ${
+                      className={`relative aspect-[2/3] rounded-xl overflow-hidden border transition-all duration-200 ${
                         selected
-                          ? 'border-amber-300 ring-4 ring-amber-500/40 scale-105'
-                          : 'border-zinc-700 hover:border-amber-500'
+                          ? 'border-amber-400 ring-4 ring-amber-500/30 scale-105 shadow-[0_0_20px_rgba(245,158,11,0.2)]'
+                          : 'border-white/[0.08] hover:border-amber-500/50'
                       }`}
                     >
 
                       {gold.isGenerated || String(gold.id).startsWith('generated-gold') ? (
-                        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-amber-950 via-yellow-900/90 to-black text-center p-2 border border-yellow-500/50">
+                        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-amber-950/50 via-yellow-900/30 to-black/50 text-center p-2 border border-amber-500/20">
                           <span className="text-3xl filter drop-shadow">🪙</span>
                           <span className="text-[10px] font-black text-amber-300 uppercase mt-1">Generado</span>
                           <span className="text-[8px] text-amber-200/80 font-bold">(Prioritario)</span>
@@ -8812,9 +9470,9 @@ export default function GameBoard({
 
                       {selected && (
 
-                        <div className="absolute inset-0 bg-amber-500/20 flex items-center justify-center">
+                        <div className="absolute inset-0 bg-amber-500/15 flex items-center justify-center backdrop-blur-[1px]">
 
-                          <span className="bg-amber-400 text-zinc-950 font-black text-xs rounded-full w-7 h-7 flex items-center justify-center">
+                          <span className="bg-amber-400 text-zinc-950 font-black text-xs rounded-full w-7 h-7 flex items-center justify-center shadow-lg">
                             OK
                           </span>
 
@@ -8830,7 +9488,7 @@ export default function GameBoard({
 
             </div>
 
-            <div className="flex items-center justify-between mt-4 pt-3 border-t border-zinc-800">
+            <div className="flex items-center justify-between mt-4 pt-3 border-t border-white/[0.06]">
 
               <span className="text-xs text-zinc-400">
                 Seleccionados:{' '}
@@ -8844,7 +9502,7 @@ export default function GameBoard({
               <button
                 onClick={confirmGoldPayment}
                 disabled={selectedGoldIds.length !== getCardCost(pendingCard)}
-                className="px-5 py-2 bg-amber-500 text-zinc-950 rounded-xl font-black text-xs disabled:opacity-30 disabled:cursor-not-allowed hover:bg-amber-400 transition"
+                className="px-5 py-2 bg-amber-500 text-zinc-950 rounded-xl font-black text-xs disabled:opacity-30 disabled:cursor-not-allowed hover:bg-amber-400 transition shadow-lg shadow-amber-500/20"
               >
                 Pagar y jugar
               </button>
@@ -9011,6 +9669,21 @@ export default function GameBoard({
           onOpenOpponentGraveyard={() => setShowOpponentGraveyard(true)}
           onOpenOpponentBanished={() => setShowOpponentBanished(true)}
           onOpenDarRules={() => setShowDarRulesModal(true)}
+          onDeclareAttack={(c) => declareAttack(c)}
+          onCancelAttack={(c) => cancelAttack(c)}
+          onAssignDamage={() => assignDamage()}
+          canDeclareAttackCard={(c) => {
+            const v = canDeclareAttack({
+              card: c,
+              currentPhaseIndex,
+              isMyTurn: isMultiplayer ? isMyTurn : localIsMyTurn,
+              enteredThisTurn: c.enteredThisTurn || false,
+              hasFuria: hasFury(c),
+              isRested: c.isRested || false,
+              isSilenced: c.isAbilityDisabled || c.isSilenced || false
+            });
+            return v.legal;
+          }}
           onToggleRestAlly={(c, zone) => toggleRest(c, zone === 'defense' ? setDefenseZone : setAttackZone, zone)}
           onToggleRestGold={(c) => toggleRest(c, setGoldZone, 'gold')}
           onToggleRestTotem={(c) => toggleRest(c, setTotemZone, 'totem')}
@@ -9021,6 +9694,8 @@ export default function GameBoard({
           isShufflingCastle={isShufflingCastle}
           activatingAbilityCardId={activatingAbilityCardId}
           cardDimensions={device.cardDimensions}
+          isSpectator={isSpectator}
+          spectatorsCount={matchState?.spectators?.length || (matchState as any)?.spectatorCount || (isSpectator ? 1 : 0)}
         />
       )}
 
@@ -9029,14 +9704,14 @@ export default function GameBoard({
       ===================================================== */}
       {gameNotice && (
         <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[99999] max-w-lg w-[92%] pointer-events-auto transition-all animate-bounce duration-300">
-          <div className={`p-3.5 rounded-2xl border-2 shadow-2xl backdrop-blur-xl flex items-center justify-between gap-3 text-xs font-bold ${
+          <div className={`p-3.5 rounded-2xl border backdrop-blur-xl flex items-center justify-between gap-3 text-xs font-bold shadow-[0_8px_30px_rgba(0,0,0,0.6)] ${
             gameNotice.type === 'error'
-              ? 'bg-red-950/95 border-red-500 text-red-200 shadow-red-950/80'
+              ? 'bg-red-950/90 border-red-500/30 text-red-200'
               : gameNotice.type === 'warning'
-              ? 'bg-amber-950/95 border-amber-500 text-amber-200 shadow-amber-950/80'
+              ? 'bg-amber-950/90 border-amber-500/30 text-amber-200'
               : gameNotice.type === 'success'
-              ? 'bg-emerald-950/95 border-emerald-500 text-emerald-200 shadow-emerald-950/80'
-              : 'bg-[#1a120b]/95 border-amber-500/80 text-amber-100 shadow-amber-950/80'
+              ? 'bg-emerald-950/90 border-emerald-500/30 text-emerald-200'
+              : 'bg-[#0a0c10]/90 border-white/[0.08] text-zinc-200'
           }`}>
             <div className="flex items-center gap-2.5 overflow-hidden">
               <span className="text-base shrink-0">{gameNotice.icon || (gameNotice.type === 'error' ? '⚠️' : gameNotice.type === 'success' ? '✨' : '⚔️')}</span>
@@ -9044,7 +9719,7 @@ export default function GameBoard({
             </div>
             <button
               onClick={() => setGameNotice(null)}
-              className="p-1 rounded-lg bg-black/40 hover:bg-black/70 text-zinc-400 hover:text-white transition shrink-0 cursor-pointer"
+              className="p-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] text-zinc-400 hover:text-white transition shrink-0 cursor-pointer"
             >
               <X className="w-3.5 h-3.5" />
             </button>
@@ -9056,17 +9731,17 @@ export default function GameBoard({
           MODAL DE DIÁLOGO / ELECCIÓN IN-GAME (REEMPLAZO DE PROMPT / CONFIRM)
       ===================================================== */}
       {gameDialog && (
-        <div className="fixed inset-0 z-[900] bg-black/80 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 select-none animate-fadeIn">
-          <div className="w-full max-w-sm sm:max-w-md max-h-[92dvh] bg-gradient-to-b from-[#1c140c] to-[#0c0906] border-2 border-amber-500/80 rounded-2xl sm:rounded-3xl p-3 sm:p-5 shadow-[0_25px_60px_rgba(0,0,0,0.95)] flex flex-col justify-between overflow-hidden text-center safe-area-paddings">
+        <div className="fixed inset-0 z-[900] bg-black/85 backdrop-blur-xl flex items-center justify-center p-2 sm:p-4 select-none animate-fadeIn">
+          <div className="w-full max-w-sm sm:max-w-md max-h-[92dvh] bg-[#0a0c10]/95 backdrop-blur-xl border border-white/[0.08] rounded-2xl sm:rounded-3xl p-3 sm:p-5 shadow-[0_25px_60px_rgba(0,0,0,0.95)] flex flex-col justify-between overflow-hidden text-center safe-area-paddings">
             {/* Encabezado */}
             <div className="flex flex-col items-center gap-1.5">
-              <span className="text-xs uppercase font-black tracking-widest text-amber-400 bg-amber-950/80 border border-amber-500/40 px-3 py-0.5 rounded-full">
+              <span className="text-xs uppercase font-black tracking-widest text-amber-400/80 bg-amber-500/10 border border-amber-500/20 px-3 py-0.5 rounded-full">
                 {gameDialog.badge || '⚔️ Decisión en Juego'}
               </span>
-              <h3 className="text-lg font-black text-amber-200 uppercase tracking-wide">
+              <h3 className="text-lg font-black text-zinc-100 uppercase tracking-wide">
                 {gameDialog.title}
               </h3>
-              <p className="text-xs text-zinc-300 font-medium whitespace-pre-line leading-relaxed px-2">
+              <p className="text-xs text-zinc-400 font-medium whitespace-pre-line leading-relaxed px-2">
                 {gameDialog.message}
               </p>
             </div>
@@ -9079,7 +9754,7 @@ export default function GameBoard({
                   id="game-dialog-prompt-input"
                   defaultValue={gameDialog.defaultValue || ''}
                   placeholder={gameDialog.placeholder || 'Escribe tu respuesta...'}
-                  className="w-full bg-zinc-950 border border-amber-500/60 rounded-xl px-4 py-2.5 text-center text-sm font-bold text-amber-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-amber-400"
+                  className="w-full bg-white/[0.04] border border-white/[0.08] rounded-xl px-4 py-2.5 text-center text-sm font-bold text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-amber-500/40 focus:border-amber-500/30"
                   autoFocus
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') {
@@ -9103,7 +9778,7 @@ export default function GameBoard({
                         gameDialog.resolver(opt.value);
                         setGameDialog(null);
                       }}
-                      className="py-3 px-4 bg-gradient-to-r from-[#2a1d12] to-[#1a1109] hover:from-amber-600 hover:to-amber-700 border border-amber-500/50 hover:border-amber-400 text-amber-100 hover:text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow flex flex-col items-center gap-1 group cursor-pointer"
+                      className="py-3 px-4 bg-gradient-to-r from-white/[0.04] to-white/[0.02] hover:from-amber-600 hover:to-amber-700 border border-white/[0.08] hover:border-amber-400 text-zinc-300 hover:text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow flex flex-col items-center gap-1 group cursor-pointer"
                     >
                       {opt.icon && <span className="text-base">{opt.icon}</span>}
                       <span>{opt.label}</span>
@@ -9124,7 +9799,7 @@ export default function GameBoard({
                       gameDialog.resolver(true);
                       setGameDialog(null);
                     }}
-                    className="flex-1 py-3 px-4 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-amber-950/60 cursor-pointer"
+                    className="flex-1 py-3 px-4 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-amber-500/20 cursor-pointer"
                   >
                     {gameDialog.options?.[0]?.label || 'Aceptar'}
                   </button>
@@ -9133,7 +9808,7 @@ export default function GameBoard({
                       gameDialog.resolver(false);
                       setGameDialog(null);
                     }}
-                    className="flex-1 py-3 px-4 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/80 text-zinc-300 font-bold text-xs uppercase tracking-wider rounded-xl transition cursor-pointer"
+                    className="flex-1 py-3 px-4 bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.08] text-zinc-300 font-bold text-xs uppercase tracking-wider rounded-xl transition cursor-pointer"
                   >
                     {gameDialog.options?.[1]?.label || 'Cancelar'}
                   </button>
@@ -9149,7 +9824,7 @@ export default function GameBoard({
                       gameDialog.resolver(val);
                       setGameDialog(null);
                     }}
-                    className="flex-1 py-3 px-4 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-amber-950/60 cursor-pointer"
+                    className="flex-1 py-3 px-4 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-amber-500/20 cursor-pointer"
                   >
                     Confirmar
                   </button>
@@ -9158,7 +9833,7 @@ export default function GameBoard({
                       gameDialog.resolver(null);
                       setGameDialog(null);
                     }}
-                    className="flex-1 py-3 px-4 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/80 text-zinc-300 font-bold text-xs uppercase tracking-wider rounded-xl transition cursor-pointer"
+                    className="flex-1 py-3 px-4 bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.08] text-zinc-300 font-bold text-xs uppercase tracking-wider rounded-xl transition cursor-pointer"
                   >
                     Cancelar
                   </button>
@@ -9171,11 +9846,312 @@ export default function GameBoard({
                     gameDialog.resolver(true);
                     setGameDialog(null);
                   }}
-                  className="w-full py-3 px-4 bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-amber-950/60 cursor-pointer"
+                  className="w-full py-3 px-4 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-amber-500/20 cursor-pointer"
                 >
                   Entendido
                 </button>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showMulliganModal && (() => {
+        const goldsInCurrentHand = Array.isArray(hand)
+          ? hand.filter((c: any) => c.type === 'Oro').length
+          : (goldsInHandCount ?? 0);
+        const nextNormalCount = Math.max(1, 8 - (mulliganCount || 0) - 1);
+        const canDoGoldMulligan = !usedGoldMulligan && !usedFreeMulligan && goldsInCurrentHand <= 1;
+
+        return (
+          <div className="fixed inset-0 z-[9998] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4">
+            <div className="w-full max-w-xl bg-gradient-to-b from-[#1c150f] to-[#0d0a07] border border-amber-500/40 rounded-2xl shadow-[0_10px_50px_rgba(0,0,0,0.9)] p-6 flex flex-col gap-4 text-center">
+              <h2 className="text-xl font-black text-amber-300 tracking-wider uppercase font-serif">
+                Fase de Mulligan Inicial
+              </h2>
+              <p className="text-xs text-zinc-300">
+                Revisa tu mano ({hand.length} cartas). Puedes quedarte con ella o realizar un Mulligan:
+              </p>
+              <div className="flex flex-wrap gap-2 justify-center max-h-[42vh] overflow-y-auto p-2 bg-black/40 rounded-xl border border-amber-500/20">
+                {hand.map((card: any, i: number) => (
+                  <div key={card.instanceId || i} className="w-[68px] h-[95px] rounded-lg overflow-hidden border border-amber-500/30 flex-shrink-0 shadow-md">
+                    <img src={card.imageUrl} alt={card.name} className="w-full h-full object-cover" />
+                  </div>
+                ))}
+              </div>
+              <div className="text-xs text-amber-200 font-bold">
+                {goldsInCurrentHand} Oro(s) en mano
+                {canDoGoldMulligan ? (
+                  <span className="text-yellow-400 ml-2 font-black">
+                    ★ ¡{goldsInCurrentHand === 0 ? '0 Oros' : '1 Oro'}! Puedes usar el Mulligan de Oro (robar 8 cartas).
+                  </span>
+                ) : (
+                  <span className="text-zinc-400 ml-2">
+                    {goldsInCurrentHand > 1 ? '(Tienes 2 o más oros, puedes quedarte o hacer Mulligan Normal)' : '(Mulligan de Oro ya utilizado)'}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-col sm:flex-row gap-3 mt-1">
+                <button
+                  onClick={() => setShowMulliganModal(false)}
+                  className="flex-1 py-3 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-500 hover:to-emerald-600 text-white font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-emerald-700/30 cursor-pointer"
+                >
+                  Mantener Mano ({hand.length} cartas)
+                </button>
+                {canDoGoldMulligan && (
+                  <button
+                    onClick={() => {
+                      if (executeMulligan) executeMulligan(true);
+                      else handleGoldMulligan();
+                    }}
+                    className="flex-1 py-3 bg-gradient-to-r from-amber-500 to-yellow-600 hover:from-amber-400 hover:to-yellow-500 text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-yellow-500/30 cursor-pointer"
+                  >
+                    Mulligan de Oro (8 cartas)
+                  </button>
+                )}
+                {nextNormalCount >= 1 && (
+                  <button
+                    onClick={() => {
+                      if (executeMulligan) executeMulligan(false);
+                      else handleNormalMulligan();
+                    }}
+                    className="flex-1 py-3 bg-gradient-to-r from-rose-700 to-red-800 hover:from-rose-600 hover:to-red-700 text-white font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-red-700/30 cursor-pointer"
+                  >
+                    Mulligan Normal a {nextNormalCount} {nextNormalCount === 1 ? 'carta' : 'cartas'}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* =====================================================
+          MODAL: CONFIRMACIÓN DE RENDICIÓN / SALIR (ARENA STYLE)
+      ===================================================== */}
+      {showSurrenderModal && (
+        <div className="fixed inset-0 z-[9999] bg-black/85 backdrop-blur-xl flex items-center justify-center p-4 select-none animate-fadeIn">
+          <div className="w-full max-w-md bg-gradient-to-b from-[#1a1310] via-[#0d0a07] to-black border-2 border-rose-600/50 rounded-2xl shadow-[0_0_50px_rgba(225,29,72,0.4)] p-6 flex flex-col gap-4 text-center">
+            <div className="flex flex-col items-center gap-2">
+              <span className="text-3xl">🏳️</span>
+              <h2 className="text-xl font-black text-rose-300 tracking-wider uppercase font-serif">
+                {isSpectator ? 'Salir de la Partida' : '¿Conceder la Partida?'}
+              </h2>
+              <p className="text-xs text-zinc-300 font-medium leading-relaxed px-2">
+                {isSpectator 
+                  ? 'Abandonarás la vista de espectador y volverás a la lista de salas.'
+                  : 'Si te rindes, la partida finalizará de inmediato y se otorgará la victoria a tu oponente. Esta acción no se puede deshacer.'}
+              </p>
+            </div>
+            <div className="flex gap-3 mt-2">
+              <button
+                onClick={handleSurrender}
+                className="flex-1 py-3 bg-gradient-to-r from-rose-600 to-red-700 hover:from-rose-500 hover:to-red-600 text-white font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-rose-900/40 cursor-pointer"
+              >
+                {isSpectator ? 'Confirmar Salida' : 'Sí, Conceder'}
+              </button>
+              <button
+                onClick={() => setShowSurrenderModal(false)}
+                className="flex-1 py-3 bg-zinc-800/80 hover:bg-zinc-700 text-zinc-200 font-bold text-xs uppercase tracking-wider rounded-xl border border-zinc-700/50 transition cursor-pointer"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =====================================================
+          MODAL: FIN DE PARTIDA / RESULTADO DE DUELO (BO1 & BO3)
+      ===================================================== */}
+      {(localGameResult || matchState?.phase === 'MATCH_OVER' || (matchState?.winnerId && !isSpectator)) && (
+        <div className="fixed inset-0 z-[99999] bg-black/90 backdrop-blur-2xl flex items-center justify-center p-4 select-none animate-fadeIn">
+          <div className="w-full max-w-lg bg-gradient-to-b from-[#18130e] via-[#0d0a07] to-black border-2 border-amber-500/50 rounded-3xl shadow-[0_0_80px_rgba(245,158,11,0.3)] p-6 sm:p-8 flex flex-col gap-6 text-center">
+            {localGameResult === 'VICTORY' || matchState?.winnerId === myPlayerId ? (
+              <div className="space-y-2">
+                <div className="text-5xl animate-bounce">🏆</div>
+                <h2 className="text-2xl sm:text-3xl font-black text-amber-400 tracking-wider uppercase font-serif drop-shadow-[0_0_20px_rgba(245,158,11,0.6)]">
+                  ¡VICTORIA!
+                </h2>
+                <p className="text-xs sm:text-sm text-zinc-300">
+                  ¡Has ganado este duelo con honor y maestría!
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <div className="text-5xl animate-pulse">💀</div>
+                <h2 className="text-2xl sm:text-3xl font-black text-rose-500 tracking-wider uppercase font-serif drop-shadow-[0_0_20px_rgba(225,29,72,0.6)]">
+                  DERROTA
+                </h2>
+                <p className="text-xs sm:text-sm text-zinc-300">
+                  Has caído en esta batalla. ¡Reorganiza tus estrategias para la siguiente contienda!
+                </p>
+              </div>
+            )}
+
+            {/* Marcador del Match */}
+            <div className="flex items-center justify-center gap-6 p-4 bg-black/60 rounded-2xl border border-amber-500/20">
+              <div className="text-center min-w-[80px]">
+                <span className="text-[11px] text-zinc-400 font-bold block uppercase tracking-wider">
+                  {currentUser?.username || 'Tú'}
+                </span>
+                <span className="text-3xl font-black text-amber-400 font-mono">
+                  {myScore}
+                </span>
+              </div>
+              <span className="text-xl font-black text-zinc-600">—</span>
+              <div className="text-center min-w-[80px]">
+                <span className="text-[11px] text-zinc-400 font-bold block uppercase tracking-wider">
+                  {opponentName || opponentInfo?.username || 'Rival'}
+                </span>
+                <span className="text-3xl font-black text-zinc-300 font-mono">
+                  {opponentScore}
+                </span>
+              </div>
+            </div>
+
+            {/* Acciones según formato BO1 vs BO3 */}
+            <div className="flex flex-col sm:flex-row gap-3 pt-2">
+              {(matchState?.bestOf === 3 || matchState?.isBo3 || multiplayerData?.lobbyData?.bestOf === 3) && myScore < 2 && opponentScore < 2 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const currentMainCards = [
+                      ...castleCards,
+                      ...hand,
+                      ...attackZone,
+                      ...defenseZone,
+                      ...totemZone,
+                      ...goldZone,
+                      ...graveyard,
+                      ...banished
+                    ];
+                    setLocalSideboardMain(currentMainCards);
+                    setLocalSideboardSide(Array.isArray(playerSideboard) ? [...playerSideboard] : []);
+                    setLocalGameResult(null);
+                    setShowSideboardModal(true);
+                  }}
+                  className="flex-1 py-3.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-amber-500/20 cursor-pointer"
+                >
+                  🔄 Modificar Sidedeck (15 Cartas)
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (typeof setView === 'function') {
+                    setView('lobby');
+                  } else {
+                    window.location.reload();
+                  }
+                }}
+                className="flex-1 py-3.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-black text-xs uppercase tracking-wider rounded-xl border border-zinc-700 transition cursor-pointer"
+              >
+                🚪 Salir al Menú / Lobby
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =====================================================
+          MODAL: SIDEDECK (15 CARTAS PARA BO3)
+      ===================================================== */}
+      {(showSideboardModal || matchState?.phase === 'SIDEBOARDING') && (
+        <div className="fixed inset-0 z-[99999] bg-black/90 backdrop-blur-2xl flex items-center justify-center p-4 select-none animate-fadeIn">
+          <div className="w-full max-w-4xl bg-gradient-to-b from-[#18130e] via-[#0d0a07] to-black border-2 border-amber-500/50 rounded-3xl shadow-[0_0_80px_rgba(245,158,11,0.3)] p-6 flex flex-col gap-4 max-h-[90vh]">
+            <div className="flex items-center justify-between border-b border-amber-500/20 pb-3">
+              <div>
+                <h2 className="text-base sm:text-lg font-black text-amber-400 tracking-wider uppercase font-serif flex items-center gap-2">
+                  <span>🔄</span> Fase de Sidedeck (Mejor de 3)
+                </h2>
+                <p className="text-xs text-zinc-400">
+                  Intercambia cartas entre tu Mazo Castillo (exactamente 50) y tu Sidedeck (hasta 15). Haz clic en una carta para moverla.
+                </p>
+              </div>
+              <div className="flex items-center gap-3 text-xs font-mono font-bold">
+                <span className={`px-2.5 py-1 rounded-lg border ${localSideboardMain.length === 50 ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300' : 'bg-red-500/20 border-red-500/40 text-red-300'}`}>
+                  Castillo: {localSideboardMain.length} / 50
+                </span>
+                <span className={`px-2.5 py-1 rounded-lg border ${localSideboardSide.length <= 15 ? 'bg-amber-500/20 border-amber-500/40 text-amber-300' : 'bg-red-500/20 border-red-500/40 text-red-300'}`}>
+                  Sidedeck: {localSideboardSide.length} / 15
+                </span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 overflow-y-auto">
+              {/* Columna Mazo Principal */}
+              <div className="bg-black/40 border border-zinc-800 rounded-2xl p-3 flex flex-col">
+                <span className="text-xs font-bold uppercase text-amber-300 mb-2">Mazo Castillo ({localSideboardMain.length} cartas)</span>
+                <div className="flex flex-wrap gap-1.5 overflow-y-auto max-h-[45vh] p-1">
+                  {localSideboardMain.map((card: any, idx: number) => (
+                    <div
+                      key={`main-${card.id}-${idx}`}
+                      onClick={() => {
+                        if (localSideboardSide.length >= 15) {
+                          showNotice('El Sidedeck no puede tener más de 15 cartas.', 'warning');
+                          return;
+                        }
+                        const newMain = [...localSideboardMain];
+                        const [removed] = newMain.splice(idx, 1);
+                        setLocalSideboardMain(newMain);
+                        setLocalSideboardSide([...localSideboardSide, removed]);
+                      }}
+                      className="w-[58px] h-[82px] rounded-md overflow-hidden border border-zinc-700 hover:border-amber-400 cursor-pointer transition transform hover:scale-105 shadow"
+                      title={`${card.name} - Clic para pasar al Sidedeck`}
+                    >
+                      <img src={card.imageUrl} alt={card.name} className="w-full h-full object-cover" />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Columna Sidedeck */}
+              <div className="bg-black/40 border border-zinc-800 rounded-2xl p-3 flex flex-col">
+                <span className="text-xs font-bold uppercase text-amber-300 mb-2">Sidedeck ({localSideboardSide.length} / 15 cartas)</span>
+                <div className="flex flex-wrap gap-1.5 overflow-y-auto max-h-[45vh] p-1">
+                  {localSideboardSide.length === 0 ? (
+                    <div className="w-full py-12 text-center text-zinc-500 text-xs italic">
+                      No hay cartas en el Sidedeck. Haz clic en cartas del Castillo para moverlas aquí.
+                    </div>
+                  ) : (
+                    localSideboardSide.map((card: any, idx: number) => (
+                      <div
+                        key={`side-${card.id}-${idx}`}
+                        onClick={() => {
+                          if (localSideboardMain.length >= 50) {
+                            showNotice('El Mazo Castillo ya tiene 50 cartas.', 'warning');
+                            return;
+                          }
+                          const newSide = [...localSideboardSide];
+                          const [removed] = newSide.splice(idx, 1);
+                          setLocalSideboardSide(newSide);
+                          setLocalSideboardMain([...localSideboardMain, removed]);
+                        }}
+                        className="w-[58px] h-[82px] rounded-md overflow-hidden border border-amber-500/40 hover:border-amber-300 cursor-pointer transition transform hover:scale-105 shadow"
+                        title={`${card.name} - Clic para pasar al Castillo`}
+                      >
+                        <img src={card.imageUrl} alt={card.name} className="w-full h-full object-cover" />
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-2 border-t border-zinc-800">
+              <button
+                type="button"
+                disabled={localSideboardMain.length !== 50 || localSideboardSide.length > 15 || sideboardConfirmed}
+                onClick={() => {
+                  handleConfirmSideboardSubmit();
+                  setShowSideboardModal(false);
+                }}
+                className="px-6 py-3 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 disabled:opacity-50 text-zinc-950 font-black text-xs uppercase tracking-wider rounded-xl transition shadow-lg shadow-amber-500/20 cursor-pointer"
+              >
+                {sideboardConfirmed ? 'Sidedeck Confirmado (Esperando Rival...)' : 'Confirmar Sidedeck y Continuar'}
+              </button>
             </div>
           </div>
         </div>
