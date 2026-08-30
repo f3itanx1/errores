@@ -475,6 +475,7 @@ export default function GameBoard({
 
   const [showHandDiscardModal, setShowHandDiscardModal] = useState(false);
   const [selectedHandDiscardIds, setSelectedHandDiscardIds] = useState<string[]>([]);
+  const [handLimitRequiredCount, setHandLimitRequiredCount] = useState<number | null>(null);
 
   const [showOpponentGraveyard, setShowOpponentGraveyard] = useState(false);
   const [showOpponentBanished, setShowOpponentBanished] = useState(false);
@@ -1855,6 +1856,32 @@ export default function GameBoard({
   useEffect(() => {
     if (!socket) return;
 
+    const onHandLimitChoice = (choice: any) => {
+      if (!choice) return;
+      const rawKind = String(choice.kind || choice.type || choice.actionType || choice.mode || '').toUpperCase();
+      const isHandLimit = Boolean(choice.handLimit) || /HAND[_\s-]*LIMIT|MAX[_\s-]*HAND|HAND[_\s-]*SIZE|END[_\s-]*TURN[_\s-]*DISCARD/.test(rawKind);
+      if (!isHandLimit) return;
+
+      const requested = Number(
+        choice.requiredCount ??
+        choice.discardRequired ??
+        choice.excess ??
+        choice.amount ??
+        choice.count ??
+        0
+      );
+      const required = requested > 0 ? requested : Math.max(0, (hand?.length || 0) - 8);
+      if (required <= 0) return;
+
+      setHandLimitRequiredCount(required);
+      setSelectedHandDiscardIds([]);
+      setShowHandDiscardModal(true);
+      showNotice(
+        `⚠️ Límite de Mano: debes descartar ${required} carta${required > 1 ? 's' : ''} para quedar con 8.`,
+        'warning'
+      );
+    };
+
     const onSearchOptions = (data: any) => {
       if (!data || !Array.isArray(data.cards)) return;
       setOnlineCastleSearch({
@@ -1961,6 +1988,8 @@ export default function GameBoard({
       );
     };
 
+    socket.on('choice_required', onHandLimitChoice);
+    socket.on('HAND_LIMIT_REQUIRED', onHandLimitChoice);
     socket.on('castle_search_options', onSearchOptions);
     socket.on('castle_search_cancelled', onSearchCancelled);
     socket.on('ability_prompt', onAbilityPrompt);
@@ -1975,6 +2004,8 @@ export default function GameBoard({
     socket.on('public_action_feed', onPublicActionFeed);
 
     return () => {
+      socket.off('choice_required', onHandLimitChoice);
+      socket.off('HAND_LIMIT_REQUIRED', onHandLimitChoice);
       socket.off('castle_search_options', onSearchOptions);
       socket.off('castle_search_cancelled', onSearchCancelled);
       socket.off('ability_prompt', onAbilityPrompt);
@@ -6780,56 +6811,144 @@ export default function GameBoard({
   };
 
   // =========================================================
+  // MODAL LÍMITE DE MANO — DESCARTE INTERACTIVO
+  // =========================================================
+  const renderHandDiscardModal = () => {
+    if (!showHandDiscardModal) return null;
+
+    const requiredCount = handLimitRequiredCount ?? Math.max(0, (hand?.length || 0) - 8);
+    if (requiredCount <= 0) return null;
+
+    const isSelected = (card: any) => selectedHandDiscardIds.includes(String(card?.instanceId ?? card?.id ?? ''));
+
+    const toggleDiscard = (card: any) => {
+      const id = String(card?.instanceId ?? card?.id ?? '');
+      if (!id) return;
+      setSelectedHandDiscardIds((prev) => {
+        if (prev.includes(id)) return prev.filter((x) => x !== id);
+        if (prev.length >= requiredCount) return prev;
+        return [...prev, id];
+      });
+    };
+
+    return (
+      <div className="fixed inset-0 z-[10020] bg-black/90 backdrop-blur-xl flex items-center justify-center p-4 select-none">
+        <div className="w-full max-w-4xl max-h-[92dvh] bg-gradient-to-b from-[#18130e] via-[#0d0a07] to-black border-2 border-amber-500/70 rounded-3xl shadow-[0_0_70px_rgba(245,158,11,0.25)] p-4 sm:p-6 flex flex-col">
+          <div className="flex items-center justify-between gap-4 border-b border-amber-500/20 pb-3 mb-3">
+            <div>
+              <span className="text-[10px] uppercase tracking-[0.2em] font-black text-amber-400">Límite de Mano</span>
+              <h2 className="text-xl sm:text-2xl font-black text-zinc-100 uppercase tracking-wide">Descarta hasta quedar con 8</h2>
+              <p className="text-xs text-zinc-400 mt-1">Selecciona exactamente <strong className="text-amber-300">{requiredCount}</strong> carta{requiredCount === 1 ? '' : 's'} para enviar al Cementerio.</p>
+            </div>
+            <div className="shrink-0 px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 font-black text-sm">
+              {selectedHandDiscardIds.length} / {requiredCount}
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto py-2 pr-1">
+            <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-3">
+              {(hand || []).map((card: any, index: number) => {
+                const selected = isSelected(card);
+                return (
+                  <button
+                    key={String(card?.instanceId ?? card?.id ?? index)}
+                    type="button"
+                    onClick={() => toggleDiscard(card)}
+                    className={`relative aspect-[2/3] rounded-xl overflow-hidden border-2 transition-all transform ${
+                      selected
+                        ? 'border-red-400 ring-4 ring-red-500/30 scale-105 shadow-xl shadow-red-950/40'
+                        : 'border-zinc-700 hover:border-amber-400 hover:scale-105'
+                    }`}
+                  >
+                    {card?.imageUrl ? (
+                      <img src={card.imageUrl} alt={card.name || 'Carta'} className="w-full h-full object-contain bg-black" />
+                    ) : (
+                      <div className="w-full h-full bg-zinc-900 flex items-center justify-center p-2 text-center">
+                        <span className="text-[9px] font-bold text-zinc-300">{card?.name || 'Carta'}</span>
+                      </div>
+                    )}
+                    <div className="absolute inset-x-0 bottom-0 bg-black/80 px-1 py-1 text-center">
+                      <span className="text-[8px] font-bold text-zinc-100 line-clamp-1">{card?.name || 'Carta'}</span>
+                    </div>
+                    {selected && (
+                      <div className="absolute inset-0 bg-red-500/15 flex items-center justify-center">
+                        <span className="w-9 h-9 rounded-full bg-red-500 text-white font-black flex items-center justify-center shadow-lg">✓</span>
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="border-t border-zinc-800 pt-3 mt-3 flex items-center justify-between gap-3">
+            <div className="text-xs text-zinc-400">
+              Tu mano quedará en <strong className="text-amber-300">8 cartas</strong> después del descarte.
+            </div>
+            <button
+              type="button"
+              disabled={selectedHandDiscardIds.length !== requiredCount}
+              onClick={handleConfirmHandLimitDiscard}
+              className="px-6 py-3 bg-gradient-to-r from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 disabled:opacity-30 disabled:cursor-not-allowed text-white font-black text-xs uppercase tracking-wider rounded-xl shadow-lg transition"
+            >
+              Descartar {requiredCount} y continuar
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // =========================================================
   // ROBO FASE FINAL
   // =========================================================
 
-  const drawCardAtFinalPhase = () => {
-    if (hasDrawnThisFinal) return;
+  const drawCardAtFinalPhase = (): boolean => {
+    if (hasDrawnThisFinal) return true;
 
     const firstPlayerNoDraw = turn === 1 && playerGoesFirst;
     if (firstPlayerNoDraw) {
       setHasDrawnThisFinal(true);
-      return;
+      return true;
     }
 
     const currentCastle = castleCardsRef.current || castleCards || [];
     if (currentCastle.length === 0) {
       setHasDrawnThisFinal(true);
       alert('Castillo agotado. ¡Has perdido la partida por quedarte sin cartas en tu Castillo!');
-      return;
+      return true;
     }
 
     const drawn = currentCastle[0];
     const remainingCastle = currentCastle.slice(1);
+    const nextHand = [...(hand || []), drawn];
+
     castleCardsRef.current = remainingCastle;
     setHasDrawnThisFinal(true);
     setCastleCards(remainingCastle);
-
-    setHand((prev: any[]) => {
-      const nextHand = [...prev, drawn];
-      if (nextHand.length > 8) {
-        setTimeout(() => {
-          setHand((currentHand: any[]) => {
-            if (currentHand.length > 8) {
-              const excess = currentHand.length - 8;
-              const cardsToKeep = currentHand.slice(0, 8);
-              const discarded = currentHand.slice(8);
-              setGraveyard((g: any[]) => [...(g || []), ...discarded]);
-              alert(`[Fase Final - Límite de Mano]: Tienes ${currentHand.length} cartas en mano (el máximo es 8). Se descartaron ${discarded.length} carta(s) al Cementerio por exceso de mano.`);
-              return cardsToKeep;
-            }
-            return currentHand;
-          });
-        }, 1400);
-      }
-      return nextHand;
-    });
+    setHand(nextHand);
 
     setDrawnCardAnim({
       cards: [drawn],
       count: 1
     });
     setTimeout(() => setDrawnCardAnim(null), 1600);
+
+    // Regla de límite: después del Robo de Fase Final, si superas 8,
+    // el jugador elige exactamente qué cartas conserva/descarta.
+    const excess = nextHand.length - 8;
+    if (excess > 0) {
+      setHandLimitRequiredCount(excess);
+      setSelectedHandDiscardIds([]);
+      setShowHandDiscardModal(true);
+      showNotice(
+        `⚠️ Límite de Mano: tienes ${nextHand.length} cartas. Debes descartar ${excess} para quedar con 8.`,
+        'warning'
+      );
+      return false;
+    }
+
+    return true;
   };
 
   // =========================================================
@@ -7750,25 +7869,70 @@ export default function GameBoard({
   // =========================================================
 
   const handleConfirmHandLimitDiscard = () => {
-    const excess = (hand?.length || 0) - 8;
-    if (selectedHandDiscardIds.length !== excess) {
-      alert(`Debes seleccionar exactamente ${excess} carta(s) para descartar (has seleccionado ${selectedHandDiscardIds.length}).`);
+    const requiredCount = handLimitRequiredCount ?? Math.max(0, (hand?.length || 0) - 8);
+    if (requiredCount <= 0) {
+      setShowHandDiscardModal(false);
+      setSelectedHandDiscardIds([]);
+      setHandLimitRequiredCount(null);
       return;
     }
 
-    const discardedCards = hand.filter((c: any) => selectedHandDiscardIds.includes(c.instanceId));
-    setHand((prev: any[]) => prev.filter((c: any) => !selectedHandDiscardIds.includes(c.instanceId)));
-    setGraveyard((prev: any[]) => [...(prev || []), ...discardedCards.map((c: any) => ({ ...c, zone: 'GRAVEYARD', isRested: false }))]);
+    if (selectedHandDiscardIds.length !== requiredCount) {
+      alert(`Debes seleccionar exactamente ${requiredCount} carta${requiredCount > 1 ? 's' : ''} para descartar (has seleccionado ${selectedHandDiscardIds.length}).`);
+      return;
+    }
+
+    // Online: el servidor autoritativo decide el movimiento real.
+    if (isMultiplayer) {
+      const sent = sendGameAction({
+        type: 'HAND_LIMIT_DISCARD',
+        action: 'HAND_LIMIT_DISCARD',
+        cardInstanceIds: [...selectedHandDiscardIds],
+        selectedHandDiscardIds: [...selectedHandDiscardIds],
+        requiredCount,
+        handLimit: true
+      });
+
+      if (!sent) {
+        showNotice('No se pudo enviar la decisión de límite de mano al servidor.', 'error');
+        return;
+      }
+
+      setShowHandDiscardModal(false);
+      setSelectedHandDiscardIds([]);
+      setHandLimitRequiredCount(null);
+      return;
+    }
+
+    // Local / VS IA: aplicar exactamente las cartas seleccionadas y NO volver a robar.
+    const discardedCards = (hand || []).filter((c: any) => {
+      const id = String(c?.instanceId ?? c?.id ?? '');
+      return selectedHandDiscardIds.includes(id);
+    });
+
+    if (discardedCards.length !== requiredCount) {
+      alert('Una o más cartas seleccionadas ya no están en tu mano. Vuelve a seleccionarlas.');
+      setSelectedHandDiscardIds([]);
+      return;
+    }
+
+    const discardedIds = new Set(selectedHandDiscardIds.map(String));
+    setHand((prev: any[]) => (prev || []).filter((c: any) => !discardedIds.has(String(c?.instanceId ?? c?.id ?? ''))));
+    setGraveyard((prev: any[]) => [
+      ...(prev || []),
+      ...discardedCards.map((c: any) => ({ ...c, zone: 'GRAVEYARD', isRested: false }))
+    ]);
     setShowHandDiscardModal(false);
     setSelectedHandDiscardIds([]);
-    showNotice(`🗑️ Descartaste ${discardedCards.length} carta(s) por límite de mano.`, 'info');
+    setHandLimitRequiredCount(null);
+    showNotice(`🗑️ Descartaste ${discardedCards.length} carta${discardedCards.length > 1 ? 's' : ''} por límite de mano.`, 'info');
 
-    // Continuar el fin de turno
-    finalizeEndOfTurn();
+    // El robo de Fase Final ya ocurrió. Continuar sin volver a llamar a drawCardAtFinalPhase().
+    finalizeEndOfTurn(true);
   };
 
-  const finalizeEndOfTurn = () => {
-    drawCardAtFinalPhase();
+  const finalizeEndOfTurn = (skipFinalDraw: boolean = false) => {
+    if (!skipFinalDraw && !drawCardAtFinalPhase()) return;
 
     // Resetear el límite de Oro por turno en Agrupación teniendo en cuenta penalizaciones
     if (cannotPlayGoldNextTurn) {
@@ -7888,15 +8052,7 @@ export default function GameBoard({
     const isLastPhase = currentPhaseIndex === DAR_PHASES.length - 1;
 
     if (isLastPhase) {
-      // Regla DAR: Límite de 8 cartas en mano al finalizar Fase Final
-      if ((hand?.length || 0) > 8) {
-        const excess = (hand?.length || 0) - 8;
-        setSelectedHandDiscardIds([]);
-        setShowHandDiscardModal(true);
-        showNotice(`⚠️ Límite de Mano: Tienes ${hand.length} cartas (máximo 8). Selecciona ${excess} carta(s) para descartar.`, 'warning');
-        return;
-      }
-
+      // El check de límite ocurre dentro de drawCardAtFinalPhase(), justo después del Robo de Fase Final.
       finalizeEndOfTurn();
       return;
     }
@@ -8513,6 +8669,7 @@ export default function GameBoard({
       {renderEscarapelaModal()}
       {renderPulsoKaijuModal()}
       {renderHandSelectionModal()}
+      {renderHandDiscardModal()}
       {renderDrawCardAnimation()}
       {renderCastleRevealSequenceModal()}
 
